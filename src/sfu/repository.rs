@@ -25,8 +25,6 @@ pub trait RoomRepository: Send + Sync {
     async fn list_rooms(&self) -> Vec<String>;
 }
 
-/// In-memory implementation using HashMap
-/// This is what we'll use for Phase 2
 pub struct InMemoryRoomRepository {
     rooms: Arc<RwLock<HashMap<String, Arc<RwLock<Room>>>>>,
 }
@@ -75,32 +73,6 @@ impl RoomRepository for InMemoryRoomRepository {
         rooms.keys().cloned().collect()
     }
 }
-
-// Future Firebase implementation would look like this:
-// (we won't implement this now, just showing the extensibility)
-/*
-pub struct FirebaseRoomRepository {
-    firestore_client: FirestoreClient,
-}
-
-#[async_trait]
-impl RoomRepository for FirebaseRoomRepository {
-    async fn create_room(&self, room_id: String) -> Result<()> {
-        // Store in Firestore instead of HashMap
-        self.firestore_client.collection("rooms")
-            .document(&room_id)
-            .set(...)
-            .await
-    }
-
-    async fn get_room(&self, room_id: &str) -> Option<Arc<RwLock<Room>>> {
-        // Fetch from Firestore, convert to Room object
-        // Return Arc<RwLock<Room>> for compatibility
-    }
-
-    // ... other methods
-}
-*/
 
 #[cfg(test)]
 mod tests {

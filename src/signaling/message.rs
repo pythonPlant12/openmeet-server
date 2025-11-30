@@ -54,6 +54,14 @@ pub enum SignalingMessage {
         participant_id: String,
     },
 
+    /// Maps a stream ID to its owner participant
+    #[serde(rename_all = "camelCase")]
+    StreamOwner {
+        stream_id: String,
+        participant_id: String,
+        participant_name: String,
+    },
+
     /// Participant toggled their audio/video
     #[serde(rename_all = "camelCase")]
     MediaStateChanged {

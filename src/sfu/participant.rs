@@ -1,5 +1,7 @@
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
+use std::sync::Arc;
 use crate::signaling::message::SignalingMessage;
+use crate::sfu::peer_connection::SfuPeerConnection;
 
 /// Represents a participant in a video conference room
 #[derive(Debug, Clone)]
@@ -29,10 +31,11 @@ impl Participant {
     }
 }
 
-/// Connection info for a participant (WebSocket sender)
+/// Connection info for a participant (WebSocket sender + WebRTC peer connection)
 pub struct ParticipantConnection {
     pub participant: Participant,
     pub sender: mpsc::UnboundedSender<SignalingMessage>,
+    pub peer_connection: Option<Arc<Mutex<SfuPeerConnection>>>,
 }
 
 impl ParticipantConnection {
@@ -40,10 +43,21 @@ impl ParticipantConnection {
         Self {
             participant,
             sender,
+            peer_connection: None,
         }
     }
 
-    /// Send a message to this participant
+    /// Set the peer connection for this participant
+    pub fn set_peer_connection(&mut self, peer_connection: Arc<Mutex<SfuPeerConnection>>) {
+        self.peer_connection = Some(peer_connection);
+    }
+
+    /// Get the peer connection if it exists
+    pub fn get_peer_connection(&self) -> Option<Arc<Mutex<SfuPeerConnection>>> {
+        self.peer_connection.clone()
+    }
+
+    /// Send a signaling message to this participant
     pub fn send(&self, message: SignalingMessage) -> Result<(), String> {
         self.sender
             .send(message)

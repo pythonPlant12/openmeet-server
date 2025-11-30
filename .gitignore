@@ -1,1 +1,6 @@
 /target
+
+# SSL certificates for local testing
+certs/
+
+logs.txt
