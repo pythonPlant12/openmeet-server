@@ -5,6 +5,7 @@ use tracing::{debug, error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
+use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
@@ -23,6 +24,8 @@ pub struct PeerConnectionConfig {
     pub ice_servers: Vec<RTCIceServer>,
     /// Public IP for NAT traversal (optional, only needed in production behind NAT)
     pub public_ip: Option<String>,
+    /// UDP port range for WebRTC media (min, max). If None, uses OS ephemeral ports.
+    pub udp_port_range: Option<(u16, u16)>,
 }
 
 impl Default for PeerConnectionConfig {
@@ -33,6 +36,7 @@ impl Default for PeerConnectionConfig {
                 ..Default::default()
             }],
             public_ip: None,
+            udp_port_range: None,
         }
     }
 }
@@ -41,6 +45,12 @@ impl PeerConnectionConfig {
     /// Create config with public IP for NAT traversal (production use)
     pub fn with_public_ip(mut self, public_ip: String) -> Self {
         self.public_ip = Some(public_ip);
+        self
+    }
+
+    /// Set UDP port range for WebRTC media (production use)
+    pub fn with_udp_port_range(mut self, min: u16, max: u16) -> Self {
+        self.udp_port_range = Some((min, max));
         self
     }
 }
@@ -76,6 +86,14 @@ impl SfuPeerConnection {
         if let Some(ref public_ip) = config.public_ip {
             info!("Configuring NAT1to1 IP mapping: {}", public_ip);
             setting_engine.set_nat_1to1_ips(vec![public_ip.clone()], RTCIceCandidateType::Host);
+        }
+
+        // Configure UDP port range if specified
+        // This ensures WebRTC uses predictable ports that match firewall rules
+        if let Some((min_port, max_port)) = config.udp_port_range {
+            info!("Configuring UDP port range: {}-{}", min_port, max_port);
+            let ephemeral_udp = EphemeralUDP::new(min_port, max_port)?;
+            setting_engine.set_udp_network(UDPNetwork::Ephemeral(ephemeral_udp));
         }
 
         // Build WebRTC API with interceptors for RTCP feedback handling

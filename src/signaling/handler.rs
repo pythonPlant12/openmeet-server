@@ -174,10 +174,24 @@ async fn handle_message(
 
                 // Create WebRTC peer connection for this participant
                 // Use PUBLIC_IP env var for NAT traversal (production), or None (localhost dev)
-                let config = match std::env::var("PUBLIC_IP") {
-                    Ok(ip) if !ip.is_empty() => PeerConnectionConfig::default().with_public_ip(ip),
-                    _ => PeerConnectionConfig::default(),
-                };
+                let mut config = PeerConnectionConfig::default();
+
+                // Configure NAT1to1 IP if PUBLIC_IP is set
+                if let Ok(ip) = std::env::var("PUBLIC_IP") {
+                    if !ip.is_empty() {
+                        config = config.with_public_ip(ip);
+                    }
+                }
+
+                // Configure UDP port range if both UDP_PORT_MIN and UDP_PORT_MAX are set
+                if let (Ok(min_str), Ok(max_str)) = (
+                    std::env::var("UDP_PORT_MIN"),
+                    std::env::var("UDP_PORT_MAX"),
+                ) {
+                    if let (Ok(min), Ok(max)) = (min_str.parse::<u16>(), max_str.parse::<u16>()) {
+                        config = config.with_udp_port_range(min, max);
+                    }
+                }
                 match SfuPeerConnection::new(participant_id.to_string(), config).await {
                     Ok(peer_conn) => {
                         // Set up track handler to forward media to other participants
