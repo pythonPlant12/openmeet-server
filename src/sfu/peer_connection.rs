@@ -4,7 +4,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -19,6 +21,8 @@ use webrtc::track::track_remote::TrackRemote;
 #[derive(Clone)]
 pub struct PeerConnectionConfig {
     pub ice_servers: Vec<RTCIceServer>,
+    /// Public IP for NAT traversal (optional, only needed in production behind NAT)
+    pub public_ip: Option<String>,
 }
 
 impl Default for PeerConnectionConfig {
@@ -28,7 +32,16 @@ impl Default for PeerConnectionConfig {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                 ..Default::default()
             }],
+            public_ip: None,
         }
+    }
+}
+
+impl PeerConnectionConfig {
+    /// Create config with public IP for NAT traversal (production use)
+    pub fn with_public_ip(mut self, public_ip: String) -> Self {
+        self.public_ip = Some(public_ip);
+        self
     }
 }
 
@@ -55,8 +68,19 @@ impl SfuPeerConnection {
         let mut interceptor_registry = Registry::new();
         interceptor_registry = register_default_interceptors(interceptor_registry, &mut media_engine)?;
 
+        // Create setting engine for NAT traversal configuration
+        let mut setting_engine = SettingEngine::default();
+
+        // Configure NAT1to1 IP mapping if public IP is provided
+        // This tells WebRTC to replace private IPs with the public IP in ICE candidates
+        if let Some(ref public_ip) = config.public_ip {
+            info!("Configuring NAT1to1 IP mapping: {}", public_ip);
+            setting_engine.set_nat_1to1_ips(vec![public_ip.clone()], RTCIceCandidateType::Host);
+        }
+
         // Build WebRTC API with interceptors for RTCP feedback handling
         let api = APIBuilder::new()
+            .with_setting_engine(setting_engine)
             .with_media_engine(media_engine)
             .with_interceptor_registry(interceptor_registry)
             .build();
