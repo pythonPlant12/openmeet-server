@@ -194,6 +194,42 @@ async fn handle_message(
                 }
                 match SfuPeerConnection::new(participant_id.to_string(), config).await {
                     Ok(peer_conn) => {
+                        // Set up ICE candidate handler to send SFU candidates to client
+                        {
+                            let pc = peer_conn.lock().await;
+                            let raw_pc = pc.get_peer_connection();
+                            let tx_ice = tx.clone();
+                            let participant_id_ice = participant_id.to_string();
+
+                            raw_pc.on_ice_candidate(Box::new(move |candidate| {
+                                let tx = tx_ice.clone();
+                                let participant_id = participant_id_ice.clone();
+                                Box::pin(async move {
+                                    if let Some(candidate) = candidate {
+                                        match candidate.to_json() {
+                                            Ok(init) => {
+                                                info!(
+                                                    "SFU generated ICE candidate for {}: {}",
+                                                    participant_id, init.candidate
+                                                );
+                                                let _ = tx.send(SignalingMessage::IceCandidate {
+                                                    target_id: participant_id,
+                                                    candidate: init.candidate,
+                                                    sdp_mid: init.sdp_mid,
+                                                    sdp_m_line_index: init.sdp_mline_index,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to serialize ICE candidate: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        info!("ICE gathering complete for {}", participant_id);
+                                    }
+                                })
+                            }));
+                        }
+
                         // Set up track handler to forward media to other participants
                         let room_lock_clone = Arc::clone(&room_lock);
                         let participant_id_clone = participant_id.to_string();
