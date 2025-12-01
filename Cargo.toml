@@ -31,6 +31,19 @@ webrtc = "0.14"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 anyhow = "1.0"
 async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+
+# Database
+diesel = { version = "2.3.4", features = ["postgres", "uuid", "chrono"] }
+diesel-async = { version = "0.7.4", features = ["postgres", "deadpool"] }
+diesel_migrations = "2.2"
+
+# Auth
+argon2 = "0.5"
+jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
+sha2 = "0.10"
+rand = "0.8"
 
 # Logging
 tracing = "0.1.43"

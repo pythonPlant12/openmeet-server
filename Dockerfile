@@ -2,9 +2,14 @@
 # Stage 2: prod    - Minimal runtime image with just binary
 
 # --- Stage 1: Builder ---
-FROM rust:1.91.1-alpine AS builder
+FROM rust:1.91.1-bookworm AS builder
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
+# Install build dependencies including PostgreSQL client library
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -13,19 +18,26 @@ COPY Cargo.toml Cargo.lock ./
 # Create dummy main.rs for dependency compilation
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
-# Build dependencies
+# Build dependencies (without migrations yet)
 RUN cargo build --release && rm -rf src
 
+# Copy source and migrations (needed for embed_migrations! macro)
 COPY src ./src
+COPY migrations ./migrations
+COPY diesel.toml ./
 
 # Build the real app binary
 RUN touch src/main.rs && cargo build --release
 
 # --- Stage 2: Production ---
-FROM alpine:3.19 AS prod
+FROM debian:bookworm-slim AS prod
 
-# Install runtime dependencies
-RUN apk add --no-cache ca-certificates
+# Install runtime dependencies (libpq for PostgreSQL, ca-certificates for HTTPS, netcat for healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libpq5 \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
