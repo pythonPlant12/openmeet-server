@@ -672,6 +672,29 @@ async fn handle_message(
             }
         }
 
+        SignalingMessage::ChatMessage {
+            participant_id: _,
+            participant_name: _,
+            message,
+            timestamp,
+        } => {
+            // Broadcast chat message to all participants in the room (including sender)
+            if let Some(room_id) = current_room_id {
+                if let Some(room_lock) = room_repo.get_room(room_id).await {
+                    let room = room_lock.read().await;
+                    let sender_name = participant_name.clone().unwrap_or_else(|| "Unknown".to_string());
+
+                    info!("💬 {} sent message in room {}", sender_name, room_id);
+                    room.broadcast(SignalingMessage::ChatMessage {
+                        participant_id: participant_id.to_string(),
+                        participant_name: sender_name,
+                        message,
+                        timestamp,
+                    });
+                }
+            }
+        }
+
         _ => {
             warn!("Unhandled message type from {}", participant_id);
         }

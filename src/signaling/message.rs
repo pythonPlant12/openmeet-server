@@ -70,6 +70,15 @@ pub enum SignalingMessage {
         video_enabled: bool,
     },
 
+    /// Chat message from a participant
+    #[serde(rename_all = "camelCase")]
+    ChatMessage {
+        participant_id: String,
+        participant_name: String,
+        message: String,
+        timestamp: u64,
+    },
+
     /// Error message from server
     Error {
         message: String,
