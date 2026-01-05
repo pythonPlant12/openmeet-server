@@ -47,7 +47,7 @@ COPY --from=builder /app/target/release/openmeet-server /app/openmeet-server
 # Copy certs directory (will be mounted in production)
 RUN mkdir -p /app/certs
 
-# Expose WebSocket port
+# Expose WebSocket/API port (also serves /metrics for Prometheus)
 EXPOSE 8081
 
 # Health check via TCP (WebSocket server)

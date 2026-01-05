@@ -6,6 +6,7 @@ use axum::{
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
+use metrics::{counter, gauge};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -39,6 +40,10 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
 
     let participant_id = Uuid::new_v4().to_string();
     info!("New WebSocket connection: {}", participant_id);
+
+    // Metrics: track new connection
+    counter!("sfu_websocket_connections_total").increment(1);
+    gauge!("sfu_active_connections").increment(1.0);
 
     // Task to send messages from the channel to the WebSocket
     let participant_id_for_logging = participant_id.clone();
@@ -122,6 +127,9 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
                         drop(room); // Release lock before deleting
                         let _ = room_repo.delete_room(&room_id).await;
                         info!("Deleted empty room: {}", room_id);
+                        // Metrics: room deleted
+                        counter!("sfu_rooms_deleted_total").increment(1);
+                        gauge!("sfu_active_rooms").decrement(1.0);
                     }
                 }
             }
@@ -129,6 +137,10 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
     }
 
     info!("WebSocket connection closed: {}", participant_id);
+
+    // Metrics: track disconnection
+    counter!("sfu_websocket_disconnections_total").increment(1);
+    gauge!("sfu_active_connections").decrement(1.0);
 }
 
 /// Handle individual signaling messages
@@ -159,6 +171,9 @@ async fn handle_message(
                     });
                     return;
                 }
+                // Metrics: new room created
+                counter!("sfu_rooms_created_total").increment(1);
+                gauge!("sfu_active_rooms").increment(1.0);
             }
 
             // Get the room
@@ -194,6 +209,8 @@ async fn handle_message(
                 }
                 match SfuPeerConnection::new(participant_id.to_string(), config).await {
                     Ok(peer_conn) => {
+                        // Metrics: peer connection created successfully
+                        counter!("sfu_peer_connections_created_total").increment(1);
                         // Set up ICE candidate handler to send SFU candidates to client
                         {
                             let pc = peer_conn.lock().await;
@@ -258,6 +275,8 @@ async fn handle_message(
                     }
                     Err(e) => {
                         error!("Failed to create peer connection for {}: {}", participant_id, e);
+                        // Metrics: peer connection failed
+                        counter!("sfu_peer_connection_failures_total").increment(1);
                         let _ = tx.send(SignalingMessage::Error {
                             message: format!("Failed to create peer connection: {}", e),
                         });
@@ -266,6 +285,8 @@ async fn handle_message(
                 }
 
                 room.add_participant(participant_conn);
+                // Metrics: participant joined
+                counter!("sfu_participants_joined_total").increment(1);
 
                 // Update state
                 *current_room_id = Some(room_id.clone());
@@ -633,6 +654,8 @@ async fn handle_message(
                             {
                                 Ok(_) => {
                                     info!("Added ICE candidate for participant {}", participant_id);
+                                    // Metrics: ICE candidate received
+                                    counter!("sfu_ice_candidates_received_total").increment(1);
                                 }
                                 Err(e) => {
                                     error!("Failed to add ICE candidate for {}: {}", participant_id, e);

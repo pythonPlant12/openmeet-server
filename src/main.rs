@@ -8,6 +8,7 @@ use axum::{routing::get, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use diesel::{Connection, PgConnection};
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub pool: DbPool,
     pub jwt: JwtConfig,
     pub room_repo: Arc<dyn RoomRepository>,
+    pub metrics_handle: PrometheusHandle,
 }
 
 // Allows WebSocket handler to extract just room_repo from AppState
@@ -80,10 +82,17 @@ async fn main() {
     // Room repository (in-memory)
     let room_repo: Arc<dyn RoomRepository> = Arc::new(InMemoryRoomRepository::new());
 
+    // Initialize Prometheus metrics
+    let metrics_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("Failed to install Prometheus recorder");
+    info!("Prometheus metrics initialized");
+
     let state = AppState {
         pool,
         jwt,
         room_repo,
+        metrics_handle,
     };
 
     let cors = CorsLayer::new()
@@ -94,6 +103,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/ws", get(websocket_handler))
+        .route("/metrics", get(metrics_handler))
         .nest("/auth", auth_routes())
         .layer(cors)
         .with_state(state);
@@ -132,4 +142,10 @@ async fn main() {
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> String {
+    state.metrics_handle.render()
 }
