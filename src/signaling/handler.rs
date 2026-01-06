@@ -207,6 +207,25 @@ async fn handle_message(
                         config = config.with_udp_port_range(min, max);
                     }
                 }
+
+                // Configure TURN server for users behind symmetric NAT/restrictive firewalls
+                if let (Ok(turn_url), Ok(turn_user), Ok(turn_password)) = (
+                    std::env::var("TURN_URL"),
+                    std::env::var("TURN_USER"),
+                    std::env::var("TURN_PASSWORD"),
+                ) {
+                    if !turn_url.is_empty() && !turn_user.is_empty() {
+                        info!("Configuring TURN server: {}", turn_url);
+                        config = config.with_turn_server(turn_url, turn_user, turn_password);
+                    }
+                }
+
+                // Configure custom STUN server if provided (in addition to default Google STUN)
+                if let Ok(stun_url) = std::env::var("STUN_URL") {
+                    if !stun_url.is_empty() {
+                        config = config.with_stun_server(stun_url);
+                    }
+                }
                 match SfuPeerConnection::new(participant_id.to_string(), config).await {
                     Ok(peer_conn) => {
                         // Metrics: peer connection created successfully

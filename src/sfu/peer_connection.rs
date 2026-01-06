@@ -53,6 +53,26 @@ impl PeerConnectionConfig {
         self.udp_port_range = Some((min, max));
         self
     }
+
+    /// Add a TURN server for NAT traversal (required for users behind symmetric NAT)
+    pub fn with_turn_server(mut self, url: String, username: String, credential: String) -> Self {
+        self.ice_servers.push(RTCIceServer {
+            urls: vec![url],
+            username,
+            credential,
+            ..Default::default()
+        });
+        self
+    }
+
+    /// Add a STUN server
+    pub fn with_stun_server(mut self, url: String) -> Self {
+        self.ice_servers.push(RTCIceServer {
+            urls: vec![url],
+            ..Default::default()
+        });
+        self
+    }
 }
 
 /// Wrapper around RTCPeerConnection with SFU-specific logic
