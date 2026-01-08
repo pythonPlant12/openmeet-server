@@ -397,8 +397,6 @@ async fn handle_message(
                                                 let tx_for_renego = tx.clone();
                                                 let participant_id_for_renego = participant_id.to_string();
                                                 let negotiated_tracks_ref = Arc::clone(&room.negotiated_tracks);
-                                                let room_repo_for_task = Arc::clone(&room_repo);
-                                                let room_id_for_task = room_id.clone();
 
                                                 // Collect sender info for StreamOwner messages
                                                 let sender_info: std::collections::HashMap<String, String> = room.participants
@@ -480,7 +478,6 @@ async fn handle_message(
 
                                                             // Mark tracks as negotiated and start RTP forwarding via broadcast subscription
                                                             let mut negotiated = negotiated_tracks_ref.write().await;
-                                                            let mut all_task_handles = Vec::new();
                                                             for (track_remote, local_track, rtp_sender, from_id, track_id, sender_pc, sender_ssrc, packet_broadcaster) in pending_forwards {
                                                                 negotiated
                                                                     .entry(participant_id_for_renego.clone())
@@ -501,7 +498,7 @@ async fn handle_message(
                                                                 };
 
                                                                 // Subscribe late joiner to existing broadcast channel
-                                                                let handles = Room::subscribe_new_participant_to_track(
+                                                                Room::subscribe_new_participant_to_track(
                                                                     local_track,
                                                                     rtp_sender,
                                                                     &packet_broadcaster,
@@ -512,7 +509,6 @@ async fn handle_message(
                                                                     to_id.clone(),
                                                                     track_kind,
                                                                 );
-                                                                all_task_handles.extend(handles);
 
                                                                 // CRITICAL: Send PLI to original sender to request immediate keyframe
                                                                 // This ensures the new participant gets a fresh keyframe right away
@@ -526,19 +522,6 @@ async fn handle_message(
                                                                     } else {
                                                                         info!("📹 Sent PLI to {} requesting keyframe for new participant {}", from_id_clone, participant_id_for_renego);
                                                                     }
-                                                                }
-                                                            }
-                                                            // Drop negotiated lock before acquiring room lock
-                                                            drop(negotiated);
-
-                                                            // Register all task handles for cleanup when this participant disconnects
-                                                            if !all_task_handles.is_empty() {
-                                                                if let Some(room_lock) = room_repo_for_task.get_room(&room_id_for_task).await {
-                                                                    let mut room = room_lock.write().await;
-                                                                    for handle in all_task_handles {
-                                                                        room.register_task(&participant_id_for_renego, handle);
-                                                                    }
-                                                                    info!("Registered late joiner tasks for {}", participant_id_for_renego);
                                                                 }
                                                             }
                                                         }

@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
-tokio-util = "0.7"
 
 # Web framework
 axum = { version = "0.8.7", features = ["ws"] }
