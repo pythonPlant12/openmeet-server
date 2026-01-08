@@ -68,17 +68,36 @@ impl Room {
     }
 
     /// Remove a participant from the room
-    pub fn remove_participant(&mut self, participant_id: &str) {
-        if let Some(_) = self.participants.remove(participant_id) {
-            info!("Removed participant {} from room {}", participant_id, self.id);
+    pub async fn remove_participant(&mut self, participant_id: &str) {
+        if let Some(participant_conn) = self.participants.remove(participant_id) {
+            info!("Removing participant {} from room {}", participant_id, self.id);
 
-            // Remove their tracks
+            // CRITICAL: Close peer connection to stop all WebRTC tasks
+            // This causes read_rtp() and other blocking calls to error out
+            if let Some(peer_conn) = participant_conn.get_peer_connection() {
+                let pc = peer_conn.lock().await;
+                if let Err(e) = pc.close().await {
+                    warn!("Error closing peer connection for {}: {}", participant_id, e);
+                } else {
+                    info!("Closed peer connection for {}", participant_id);
+                }
+            }
+
+            // Remove their tracks (drops broadcast::Sender, causing receivers to stop)
             self.remove_participant_tracks(participant_id);
+
+            // Clear negotiated tracks for this participant
+            {
+                let mut negotiated = self.negotiated_tracks.write().await;
+                negotiated.remove(participant_id);
+            }
 
             // Notify all remaining participants
             self.broadcast(SignalingMessage::ParticipantLeft {
                 participant_id: participant_id.to_string(),
             });
+
+            info!("Removed participant {} from room {}", participant_id, self.id);
         } else {
             warn!("Tried to remove non-existent participant: {}", participant_id);
         }
@@ -604,13 +623,27 @@ impl Room {
     }
 
     /// Remove all tracks for a participant (called when they leave)
+    /// This drops the broadcast::Sender for each track, which causes all
+    /// receiver tasks (writer tasks) to get a Closed error and terminate.
     pub fn remove_participant_tracks(&mut self, participant_id: &str) {
         if let Some(tracks) = self.participant_tracks.remove(participant_id) {
+            let track_count = tracks.len();
+
+            // Explicitly drop each track info to release broadcast senders
+            // When the last sender is dropped, all receivers will get Closed error
+            for track_info in tracks {
+                // Log before dropping
+                debug!(
+                    "Room {}: Dropping track (ssrc: {}) for participant {}",
+                    self.id, track_info.sender_ssrc, participant_id
+                );
+                // track_info is dropped here, including packet_broadcaster (broadcast::Sender)
+                drop(track_info);
+            }
+
             info!(
-                "Room {}: Removed {} tracks for participant {}",
-                self.id,
-                tracks.len(),
-                participant_id
+                "Room {}: Removed {} tracks for participant {} (broadcast channels closed)",
+                self.id, track_count, participant_id
             );
         }
     }

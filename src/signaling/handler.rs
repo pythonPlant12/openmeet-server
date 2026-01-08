@@ -120,7 +120,7 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
             if let Ok((Some(room_id), participant_id)) = result {
                 if let Some(room_lock) = room_repo.get_room(&room_id).await {
                     let mut room = room_lock.write().await;
-                    room.remove_participant(&participant_id);
+                    room.remove_participant(&participant_id).await;
 
                     // Delete room if empty
                     if room.is_empty() {
