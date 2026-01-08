@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
@@ -38,6 +39,9 @@ pub struct Room {
     /// Track IDs that have been successfully negotiated to each participant.
     /// Uses track_id (not stream_id) because audio+video share same stream_id.
     pub negotiated_tracks: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Task handles for each participant - used to abort tasks on disconnect
+    /// Key is participant_id, value is list of JoinHandles for that participant's tasks
+    task_handles: HashMap<String, Vec<JoinHandle<()>>>,
 }
 
 impl Room {
@@ -48,6 +52,26 @@ impl Room {
             participants: HashMap::new(),
             participant_tracks: HashMap::new(),
             negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
+            task_handles: HashMap::new(),
+        }
+    }
+
+    /// Register a task handle for a participant (for cleanup on disconnect)
+    pub fn register_task(&mut self, participant_id: &str, handle: JoinHandle<()>) {
+        self.task_handles
+            .entry(participant_id.to_string())
+            .or_insert_with(Vec::new)
+            .push(handle);
+    }
+
+    /// Abort all tasks for a participant
+    fn abort_participant_tasks(&mut self, participant_id: &str) {
+        if let Some(handles) = self.task_handles.remove(participant_id) {
+            let count = handles.len();
+            for handle in handles {
+                handle.abort();
+            }
+            info!("Room {}: Aborted {} tasks for participant {}", self.id, count, participant_id);
         }
     }
 
@@ -82,6 +106,10 @@ impl Room {
                     info!("Closed peer connection for {}", participant_id);
                 }
             }
+
+            // CRITICAL: Abort all spawned tasks for this participant
+            // This ensures tasks don't keep running and holding memory
+            self.abort_participant_tasks(participant_id);
 
             // Remove their tracks (drops broadcast::Sender, causing receivers to stop)
             self.remove_participant_tracks(participant_id);
@@ -205,8 +233,9 @@ impl Room {
 
     /// Forward a track from one participant to all others in the room
     /// Uses broadcast channel pattern: ONE reader task broadcasts to ALL writer tasks
+    /// All spawned tasks are registered to the sender's participant_id for cleanup
     async fn forward_track_to_others(
-        &self,
+        &mut self,
         sender_id: &str,
         track: Arc<TrackRemote>,
         sender_peer_connection: Arc<RTCPeerConnection>,
@@ -318,7 +347,7 @@ impl Room {
         let packet_tx_clone = packet_tx.clone();
 
         // Reader task: reads from remote track and broadcasts to all receivers
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
             let mut packet_count = 0u64;
 
             loop {
@@ -347,7 +376,13 @@ impl Room {
             info!("Reader task ended: {} {} packets FROM {}", packet_count, track_kind, from_id);
         });
 
+        // Register reader task for cleanup when sender disconnects
+        self.register_task(sender_id, reader_handle);
+
         // Spawn writer tasks for each current receiver (late joiners use subscribe_new_participant_to_track)
+        // Collect task handles for registration
+        let mut task_handles: Vec<JoinHandle<()>> = Vec::new();
+
         if !receivers.is_empty() {
             for (to_id, local_track, rtp_sender, local_ssrc) in receivers {
                 let mut packet_rx = packet_tx.subscribe();
@@ -366,7 +401,7 @@ impl Room {
                 let from_id_clone = from_id.clone();
                 let to_id_clone = to_id.clone();
 
-                tokio::spawn(async move {
+                let rtcp_handle = tokio::spawn(async move {
                     Self::handle_rtcp_feedback(
                         rtp_sender_clone,
                         sender_pc_clone,
@@ -379,9 +414,10 @@ impl Room {
                         local_ssrc,
                     ).await;
                 });
+                task_handles.push(rtcp_handle);
 
                 // Writer task: receives from broadcast and writes to local track
-                tokio::spawn(async move {
+                let writer_handle = tokio::spawn(async move {
                     let mut packet_count = 0u64;
 
                     loop {
@@ -417,7 +453,13 @@ impl Room {
 
                     info!("Writer task ended: {} {} packets {} → {}", packet_count, kind, from_id, to_id);
                 });
+                task_handles.push(writer_handle);
             }
+        }
+
+        // Register all spawned tasks for cleanup when sender disconnects
+        for handle in task_handles {
+            self.register_task(sender_id, handle);
         }
     }
 
@@ -438,6 +480,7 @@ impl Room {
 
     /// Subscribe a new participant to an existing track (for late joiners)
     /// This spawns a writer task that receives from the track's broadcast channel
+    /// Returns task handles for cleanup registration
     pub fn subscribe_new_participant_to_track(
         local_track: Arc<TrackLocalStaticRTP>,
         rtp_sender: Arc<RTCRtpSender>,
@@ -448,7 +491,7 @@ impl Room {
         from_participant: String,
         to_participant: String,
         track_kind: webrtc::rtp_transceiver::rtp_codec::RTPCodecType,
-    ) {
+    ) -> Vec<JoinHandle<()>> {
         let mut packet_rx = packet_broadcaster.subscribe();
         let from_id = from_participant.clone();
         let to_id = to_participant.clone();
@@ -465,7 +508,7 @@ impl Room {
         let from_id_clone = from_id.clone();
         let to_id_clone = to_id.clone();
 
-        tokio::spawn(async move {
+        let rtcp_handle = tokio::spawn(async move {
             Self::handle_rtcp_feedback(
                 rtp_sender_clone,
                 sender_pc_clone,
@@ -480,7 +523,7 @@ impl Room {
         });
 
         // Writer task: receives from broadcast and writes to local track
-        tokio::spawn(async move {
+        let writer_handle = tokio::spawn(async move {
             let mut packet_count = 0u64;
 
             loop {
@@ -515,6 +558,8 @@ impl Room {
 
             info!("Late joiner writer ended: {} {} packets {} → {}", packet_count, kind, from_id, to_id);
         });
+
+        vec![rtcp_handle, writer_handle]
     }
 
     /// Handle RTCP feedback from receivers and forward PLI/NACK to the original sender
