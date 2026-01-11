@@ -398,6 +398,9 @@ async fn handle_message(
                                                 let participant_id_for_renego = participant_id.to_string();
                                                 let negotiated_tracks_ref = Arc::clone(&room.negotiated_tracks);
 
+                                                // Get the late joiner's shutdown receiver - used to stop writer tasks when they disconnect
+                                                let shutdown_rx_for_late_joiner = participant_conn.get_shutdown_receiver();
+
                                                 // Collect sender info for StreamOwner messages
                                                 let sender_info: std::collections::HashMap<String, String> = room.participants
                                                     .iter()
@@ -497,7 +500,6 @@ async fn handle_message(
                                                                     }
                                                                 };
 
-                                                                // Subscribe late joiner to existing broadcast channel
                                                                 Room::subscribe_new_participant_to_track(
                                                                     local_track,
                                                                     rtp_sender,
@@ -508,6 +510,7 @@ async fn handle_message(
                                                                     from_id.clone(),
                                                                     to_id.clone(),
                                                                     track_kind,
+                                                                    shutdown_rx_for_late_joiner.clone(),
                                                                 );
 
                                                                 // CRITICAL: Send PLI to original sender to request immediate keyframe

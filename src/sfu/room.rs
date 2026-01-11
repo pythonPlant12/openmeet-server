@@ -223,12 +223,16 @@ impl Room {
             .unwrap_or_else(|| "Unknown".to_string());
 
         // Collect receivers info before spawning tasks
-        let mut receivers: Vec<(String, Arc<TrackLocalStaticRTP>, Arc<RTCRtpSender>, u32)> = Vec::new();
+        // Includes shutdown_rx so writer tasks can detect when receiver disconnects
+        let mut receivers: Vec<(String, Arc<TrackLocalStaticRTP>, Arc<RTCRtpSender>, u32, tokio::sync::watch::Receiver<()>)> = Vec::new();
 
         for (participant_id, participant_conn) in &self.participants {
             if participant_id == sender_id {
                 continue;
             }
+
+            // Get shutdown receiver for this participant - used to stop writer tasks when they disconnect
+            let shutdown_rx = participant_conn.get_shutdown_receiver();
 
             // Send StreamOwner message BEFORE adding track so client knows the mapping
             let _ = participant_conn.send(SignalingMessage::StreamOwner {
@@ -254,7 +258,7 @@ impl Room {
                                     }
                                 };
 
-                                receivers.push((participant_id.clone(), local_track, rtp_sender, local_ssrc));
+                                receivers.push((participant_id.clone(), local_track, rtp_sender, local_ssrc, shutdown_rx.clone()));
 
                                 // Send PLI for video tracks to ensure immediate keyframe delivery
                                 if track_kind == webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video {
@@ -349,7 +353,7 @@ impl Room {
 
         // Spawn writer tasks for each current receiver (late joiners use subscribe_new_participant_to_track)
         if !receivers.is_empty() {
-            for (to_id, local_track, rtp_sender, local_ssrc) in receivers {
+            for (to_id, local_track, rtp_sender, local_ssrc, mut shutdown_rx) in receivers {
                 let mut packet_rx = packet_tx.subscribe();
                 let from_id = sender_id.to_string();
                 let sender_pc = Arc::clone(&sender_peer_connection);
@@ -381,41 +385,66 @@ impl Room {
                 });
 
                 // Writer task: receives from broadcast and writes to local track
+                // Uses select! to also listen for receiver disconnect signal
                 tokio::spawn(async move {
                     let mut packet_count = 0u64;
+                    let mut write_error_count = 0u64;
+                    let exit_reason: &str;
 
                     loop {
-                        match packet_rx.recv().await {
-                            Ok(mut rtp_packet) => {
-                                packet_count += 1;
-
-                                if packet_count % 500 == 0 {
-                                    info!("Forwarded {} {} packets {} → {}", packet_count, kind, from_id, to_id);
-                                }
-
-                                // Rewrite SSRC for this receiver
-                                rtp_packet.header.ssrc = local_ssrc;
-
-                                // Store in buffer for NACK retransmission
-                                packet_buffer.store(&rtp_packet).await;
-
-                                // Write to local track
-                                if let Err(e) = local_track.write_rtp(&rtp_packet).await {
-                                    error!("✗ Write error {} → {}: {}", from_id, to_id, e);
-                                    break;
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Closed) => {
+                        tokio::select! {
+                            // Check if the receiver has disconnected
+                            _ = shutdown_rx.changed() => {
+                                exit_reason = "receiver disconnected";
                                 break;
                             }
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                warn!("Receiver {} lagged {} packets from {}", to_id, n, from_id);
-                                // Continue - we'll catch up
+                            // Receive packet from broadcast channel
+                            result = packet_rx.recv() => {
+                                match result {
+                                    Ok(mut rtp_packet) => {
+                                        packet_count += 1;
+
+                                        if packet_count % 500 == 0 {
+                                            info!("Forwarded {} {} packets {} → {}", packet_count, kind, from_id, to_id);
+                                        }
+
+                                        // Rewrite SSRC for this receiver
+                                        rtp_packet.header.ssrc = local_ssrc;
+
+                                        // Store in buffer for NACK retransmission
+                                        packet_buffer.store(&rtp_packet).await;
+
+                                        // Write to local track
+                                        if let Err(e) = local_track.write_rtp(&rtp_packet).await {
+                                            write_error_count += 1;
+                                            // Log first error and then every 100th
+                                            if write_error_count == 1 || write_error_count % 100 == 0 {
+                                                warn!("Write error #{} {} → {}: {}", write_error_count, from_id, to_id, e);
+                                            }
+                                            // Break after 10 consecutive errors
+                                            if write_error_count >= 10 {
+                                                exit_reason = "write_rtp errors";
+                                                break;
+                                            }
+                                        } else {
+                                            // Reset error count on successful write
+                                            write_error_count = 0;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        exit_reason = "broadcast channel closed (sender disconnected)";
+                                        break;
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        warn!("Receiver {} lagged {} packets from {}", to_id, n, from_id);
+                                        // Continue - we'll catch up
+                                    }
+                                }
                             }
                         }
                     }
 
-                    info!("Writer task ended: {} {} packets {} → {}", packet_count, kind, from_id, to_id);
+                    info!("Writer task ended: {} {} packets {} → {} [reason: {}]", packet_count, kind, from_id, to_id, exit_reason);
                 });
             }
         }
@@ -438,6 +467,7 @@ impl Room {
 
     /// Subscribe a new participant to an existing track (for late joiners)
     /// This spawns a writer task that receives from the track's broadcast channel
+    /// shutdown_rx is used to detect when the receiver (late joiner) disconnects
     pub fn subscribe_new_participant_to_track(
         local_track: Arc<TrackLocalStaticRTP>,
         rtp_sender: Arc<RTCRtpSender>,
@@ -448,6 +478,7 @@ impl Room {
         from_participant: String,
         to_participant: String,
         track_kind: webrtc::rtp_transceiver::rtp_codec::RTPCodecType,
+        mut shutdown_rx: tokio::sync::watch::Receiver<()>,
     ) {
         let mut packet_rx = packet_broadcaster.subscribe();
         let from_id = from_participant.clone();
@@ -480,40 +511,65 @@ impl Room {
         });
 
         // Writer task: receives from broadcast and writes to local track
+        // Uses select! to also listen for receiver disconnect signal
         tokio::spawn(async move {
             let mut packet_count = 0u64;
+            let mut write_error_count = 0u64;
+            let exit_reason: &str;
 
             loop {
-                match packet_rx.recv().await {
-                    Ok(mut rtp_packet) => {
-                        packet_count += 1;
-
-                        if packet_count % 500 == 0 {
-                            info!("Late joiner: forwarded {} {} packets {} → {}", packet_count, kind, from_id, to_id);
-                        }
-
-                        // Rewrite SSRC for this receiver
-                        rtp_packet.header.ssrc = local_ssrc;
-
-                        // Store in buffer for NACK retransmission
-                        packet_buffer.store(&rtp_packet).await;
-
-                        // Write to local track
-                        if let Err(e) = local_track.write_rtp(&rtp_packet).await {
-                            error!("✗ Write error {} → {}: {}", from_id, to_id, e);
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
+                tokio::select! {
+                    // Check if the receiver has disconnected
+                    _ = shutdown_rx.changed() => {
+                        exit_reason = "receiver disconnected";
                         break;
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Late joiner {} lagged {} packets from {}", to_id, n, from_id);
+                    // Receive packet from broadcast channel
+                    result = packet_rx.recv() => {
+                        match result {
+                            Ok(mut rtp_packet) => {
+                                packet_count += 1;
+
+                                if packet_count % 500 == 0 {
+                                    info!("Late joiner: forwarded {} {} packets {} → {}", packet_count, kind, from_id, to_id);
+                                }
+
+                                // Rewrite SSRC for this receiver
+                                rtp_packet.header.ssrc = local_ssrc;
+
+                                // Store in buffer for NACK retransmission
+                                packet_buffer.store(&rtp_packet).await;
+
+                                // Write to local track
+                                if let Err(e) = local_track.write_rtp(&rtp_packet).await {
+                                    write_error_count += 1;
+                                    // Log first error and then every 100th
+                                    if write_error_count == 1 || write_error_count % 100 == 0 {
+                                        warn!("Late joiner write error #{} {} → {}: {}", write_error_count, from_id, to_id, e);
+                                    }
+                                    // Break after 10 consecutive errors
+                                    if write_error_count >= 10 {
+                                        exit_reason = "write_rtp errors";
+                                        break;
+                                    }
+                                } else {
+                                    // Reset error count on successful write
+                                    write_error_count = 0;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                exit_reason = "broadcast channel closed (sender disconnected)";
+                                break;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("Late joiner {} lagged {} packets from {}", to_id, n, from_id);
+                            }
+                        }
                     }
                 }
             }
 
-            info!("Late joiner writer ended: {} {} packets {} → {}", packet_count, kind, from_id, to_id);
+            info!("Late joiner writer ended: {} {} packets {} → {} [reason: {}]", packet_count, kind, from_id, to_id, exit_reason);
         });
     }
 

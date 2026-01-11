@@ -1,4 +1,4 @@
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use std::sync::Arc;
 use crate::signaling::message::SignalingMessage;
 use crate::sfu::peer_connection::SfuPeerConnection;
@@ -36,15 +36,29 @@ pub struct ParticipantConnection {
     pub participant: Participant,
     pub sender: mpsc::UnboundedSender<SignalingMessage>,
     pub peer_connection: Option<Arc<Mutex<SfuPeerConnection>>>,
+    /// Shutdown signal - when this sender is dropped, all receivers are notified.
+    /// Used to stop writer tasks that are sending TO this participant.
+    _shutdown_tx: watch::Sender<()>,
+    /// Receiver for shutdown signal - cloned and passed to writer tasks
+    shutdown_rx: watch::Receiver<()>,
 }
 
 impl ParticipantConnection {
     pub fn new(participant: Participant, sender: mpsc::UnboundedSender<SignalingMessage>) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
         Self {
             participant,
             sender,
             peer_connection: None,
+            _shutdown_tx: shutdown_tx,
+            shutdown_rx,
         }
+    }
+
+    /// Get a receiver for the shutdown signal.
+    /// Writer tasks that send TO this participant should use this to detect disconnection.
+    pub fn get_shutdown_receiver(&self) -> watch::Receiver<()> {
+        self.shutdown_rx.clone()
     }
 
     /// Set the peer connection for this participant
