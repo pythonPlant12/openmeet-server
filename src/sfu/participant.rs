@@ -1,5 +1,6 @@
 use tokio::sync::{mpsc, watch, Mutex};
 use std::sync::Arc;
+use tracing::info;
 use crate::signaling::message::SignalingMessage;
 use crate::sfu::peer_connection::SfuPeerConnection;
 
@@ -76,5 +77,16 @@ impl ParticipantConnection {
         self.sender
             .send(message)
             .map_err(|e| format!("Failed to send message: {}", e))
+    }
+}
+
+impl Drop for ParticipantConnection {
+    fn drop(&mut self) {
+        info!(
+            "DROP ParticipantConnection: {} ({}), peer_connection={}",
+            self.participant.name,
+            self.participant.id,
+            if self.peer_connection.is_some() { "present" } else { "none" }
+        );
     }
 }

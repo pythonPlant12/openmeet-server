@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use tokio::sync::RwLock;
+use tracing::info;
 use webrtc::rtp::packet::Packet as RtpPacket;
 
 /// Buffer size - store last 512 packets (roughly 5-10 seconds of video at 30fps)
@@ -71,5 +72,19 @@ impl RtpPacketBuffer {
 impl Default for RtpPacketBuffer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for RtpPacketBuffer {
+    fn drop(&mut self) {
+        // Use try_read to avoid blocking - this is in Drop so we can't await
+        if let Ok(inner) = self.inner.try_read() {
+            info!(
+                "DROP RtpPacketBuffer: {} packets stored",
+                inner.packets.len()
+            );
+        } else {
+            info!("DROP RtpPacketBuffer: (lock held, couldn't read size)");
+        }
     }
 }

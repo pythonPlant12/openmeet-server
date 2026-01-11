@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use sysinfo::{System, Pid};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -20,6 +21,18 @@ use tracing::{ info, warn, error, debug };
 /// Broadcast channel capacity for RTP packets
 const RTP_BROADCAST_CAPACITY: usize = 256;
 
+/// Log current process memory usage
+fn log_memory_usage(context: &str) {
+    let mut sys = System::new();
+    let pid = Pid::from_u32(std::process::id());
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+
+    if let Some(process) = sys.process(pid) {
+        let memory_mb = process.memory() as f64 / 1024.0 / 1024.0;
+        info!("MEMORY [{}]: {:.2} MB", context, memory_mb);
+    }
+}
+
 /// Information about a track from a sender, including the peer connection for PLI forwarding
 pub struct SenderTrackInfo {
     pub track: Arc<TrackRemote>,
@@ -27,6 +40,18 @@ pub struct SenderTrackInfo {
     pub sender_ssrc: u32,
     /// Broadcast sender for this track - new participants subscribe to this
     pub packet_broadcaster: broadcast::Sender<RtpPacket>,
+}
+
+impl Drop for SenderTrackInfo {
+    fn drop(&mut self) {
+        info!(
+            "DROP SenderTrackInfo: ssrc={}, track_refs={}, pc_refs={}, receivers={}",
+            self.sender_ssrc,
+            Arc::strong_count(&self.track),
+            Arc::strong_count(&self.sender_peer_connection),
+            self.packet_broadcaster.receiver_count()
+        );
+    }
 }
 
 /// A video conference room containing multiple participants
@@ -65,6 +90,8 @@ impl Room {
             participant_id: participant_id.clone(),
             participant_name,
         });
+
+        log_memory_usage(&format!("after adding participant {}", participant_id));
     }
 
     /// Remove a participant from the room
@@ -72,14 +99,39 @@ impl Room {
         if let Some(participant_conn) = self.participants.remove(participant_id) {
             info!("Removing participant {} from room {}", participant_id, self.id);
 
+            // Log Arc reference counts before cleanup
+            if let Some(ref peer_conn) = participant_conn.peer_connection {
+                info!(
+                    "Participant {} peer_connection Arc strong_count={}",
+                    participant_id,
+                    Arc::strong_count(peer_conn)
+                );
+            }
+
             // CRITICAL: Close peer connection to stop all WebRTC tasks
-            // This causes read_rtp() and other blocking calls to error out
             if let Some(peer_conn) = participant_conn.get_peer_connection() {
                 let pc = peer_conn.lock().await;
                 if let Err(e) = pc.close().await {
                     warn!("Error closing peer connection for {}: {}", participant_id, e);
                 } else {
                     info!("Closed peer connection for {}", participant_id);
+                }
+            }
+
+            // Log tracks being removed
+            if let Some(tracks) = self.participant_tracks.get(participant_id) {
+                info!(
+                    "Participant {} has {} tracks to remove",
+                    participant_id,
+                    tracks.len()
+                );
+                for (i, track_info) in tracks.iter().enumerate() {
+                    info!(
+                        "  Track {}: ssrc={}, broadcaster receivers={}",
+                        i,
+                        track_info.sender_ssrc,
+                        track_info.packet_broadcaster.receiver_count()
+                    );
                 }
             }
 
@@ -97,7 +149,16 @@ impl Room {
                 participant_id: participant_id.to_string(),
             });
 
-            info!("Removed participant {} from room {}", participant_id, self.id);
+            info!(
+                "Removed participant {} from room {}, remaining participants={}",
+                participant_id,
+                self.id,
+                self.participants.len()
+            );
+
+            log_memory_usage(&format!("after removing participant {}", participant_id));
+
+            // participant_conn is dropped here, triggering Drop impl logging
         } else {
             warn!("Tried to remove non-existent participant: {}", participant_id);
         }
@@ -364,11 +425,12 @@ impl Room {
                 let buffer_for_rtcp = Arc::clone(&packet_buffer);
                 let local_track_for_rtcp = Arc::clone(&local_track);
 
-                // Spawn RTCP feedback handler
+                // Spawn RTCP feedback handler with shutdown signal
                 let rtp_sender_clone = Arc::clone(&rtp_sender);
                 let sender_pc_clone = Arc::clone(&sender_pc);
                 let from_id_clone = from_id.clone();
                 let to_id_clone = to_id.clone();
+                let rtcp_shutdown_rx = shutdown_rx.clone();
 
                 tokio::spawn(async move {
                     Self::handle_rtcp_feedback(
@@ -381,6 +443,7 @@ impl Room {
                         local_track_for_rtcp,
                         buffer_for_rtcp,
                         local_ssrc,
+                        rtcp_shutdown_rx,
                     ).await;
                 });
 
@@ -490,11 +553,12 @@ impl Room {
         let buffer_for_rtcp = Arc::clone(&packet_buffer);
         let local_track_for_rtcp = Arc::clone(&local_track);
 
-        // Spawn RTCP feedback handler
+        // Spawn RTCP feedback handler with shutdown signal
         let rtp_sender_clone = Arc::clone(&rtp_sender);
         let sender_pc_clone = Arc::clone(&sender_peer_connection);
         let from_id_clone = from_id.clone();
         let to_id_clone = to_id.clone();
+        let rtcp_shutdown_rx = shutdown_rx.clone();
 
         tokio::spawn(async move {
             Self::handle_rtcp_feedback(
@@ -507,6 +571,7 @@ impl Room {
                 local_track_for_rtcp,
                 buffer_for_rtcp,
                 local_ssrc,
+                rtcp_shutdown_rx,
             ).await;
         });
 
@@ -584,98 +649,97 @@ impl Room {
         local_track: Arc<TrackLocalStaticRTP>,
         packet_buffer: Arc<RtpPacketBuffer>,
         local_ssrc: u32,
+        mut shutdown_rx: tokio::sync::watch::Receiver<()>,
     ) {
         let mut pli_count = 0u64;
         let mut nack_count = 0u64;
         let mut retransmit_count = 0u64;
+        let exit_reason: &str;
 
         loop {
-            // Read RTCP packets from the receiver (PLI, NACK, etc.)
-            match rtp_sender.read_rtcp().await {
-                Ok((rtcp_packets, _)) => {
-                    for packet in rtcp_packets {
-                        // Check if this is a PLI (Picture Loss Indication) request
-                        if packet.as_any().downcast_ref::<PictureLossIndication>().is_some() {
-                            pli_count += 1;
-                            debug!(
-                                "Received PLI #{} for {} track FROM {} (forwarding to sender {})",
-                                pli_count, track_kind, to_participant, from_participant
-                            );
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    exit_reason = "receiver disconnected";
+                    break;
+                }
+                result = rtp_sender.read_rtcp() => {
+                    match result {
+                        Ok((rtcp_packets, _)) => {
+                            for packet in rtcp_packets {
+                                if packet.as_any().downcast_ref::<PictureLossIndication>().is_some() {
+                                    pli_count += 1;
+                                    debug!(
+                                        "Received PLI #{} for {} track FROM {} (forwarding to sender {})",
+                                        pli_count, track_kind, to_participant, from_participant
+                                    );
 
-                            // Forward PLI to the original sender to request a keyframe
-                            let pli = PictureLossIndication {
-                                sender_ssrc: 0,  // Will be filled by the stack
-                                media_ssrc: sender_ssrc,
-                            };
+                                    let pli = PictureLossIndication {
+                                        sender_ssrc: 0,
+                                        media_ssrc: sender_ssrc,
+                                    };
 
-                            if let Err(e) = sender_peer_connection.write_rtcp(&[Box::new(pli)]).await {
-                                error!(
-                                    "Failed to forward PLI to sender {}: {}",
-                                    from_participant, e
-                                );
-                            } else {
-                                debug!("✓ Forwarded PLI to sender {} for {} track", from_participant, track_kind);
-                            }
-                        }
-                        // Handle NACK - retransmit requested packets from our buffer
-                        else if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
-                            nack_count += 1;
-
-                            // Extract all requested sequence numbers from the NACK
-                            let mut requested_seqs = Vec::new();
-                            for nack_pair in &nack.nacks {
-                                // The packet_id is the base sequence number
-                                requested_seqs.push(nack_pair.packet_id);
-
-                                // The lost_packets bitmask indicates which of the next 16 packets are also lost
-                                let mut bitmask = nack_pair.lost_packets;
-                                for i in 1..=16u16 {
-                                    if bitmask & 1 == 1 {
-                                        requested_seqs.push(nack_pair.packet_id.wrapping_add(i));
+                                    if let Err(e) = sender_peer_connection.write_rtcp(&[Box::new(pli)]).await {
+                                        error!(
+                                            "Failed to forward PLI to sender {}: {}",
+                                            from_participant, e
+                                        );
+                                    } else {
+                                        debug!("Forwarded PLI to sender {} for {} track", from_participant, track_kind);
                                     }
-                                    bitmask >>= 1;
                                 }
-                            }
+                                else if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
+                                    nack_count += 1;
 
-                            debug!(
-                                "Received NACK #{} for {} packets ({:?}) FROM {} - retransmitting",
-                                nack_count,
-                                requested_seqs.len(),
-                                &requested_seqs[..requested_seqs.len().min(5)], // Log first 5 seq nums
-                                to_participant
-                            );
+                                    let mut requested_seqs = Vec::new();
+                                    for nack_pair in &nack.nacks {
+                                        requested_seqs.push(nack_pair.packet_id);
 
-                            // Retransmit requested packets from buffer
-                            for seq in requested_seqs {
-                                if let Some(packet) = packet_buffer.get(seq).await {
-                                    // Verify SSRC matches (should already be rewritten)
-                                    if packet.header.ssrc == local_ssrc {
-                                        if let Err(e) = local_track.write_rtp(&packet).await {
-                                            error!("Failed to retransmit packet {}: {}", seq, e);
-                                        } else {
-                                            retransmit_count += 1;
+                                        let mut bitmask = nack_pair.lost_packets;
+                                        for i in 1..=16u16 {
+                                            if bitmask & 1 == 1 {
+                                                requested_seqs.push(nack_pair.packet_id.wrapping_add(i));
+                                            }
+                                            bitmask >>= 1;
                                         }
                                     }
-                                } else {
-                                    debug!("Packet {} not in buffer for retransmission", seq);
+
+                                    debug!(
+                                        "Received NACK #{} for {} packets ({:?}) FROM {} - retransmitting",
+                                        nack_count,
+                                        requested_seqs.len(),
+                                        &requested_seqs[..requested_seqs.len().min(5)],
+                                        to_participant
+                                    );
+
+                                    for seq in requested_seqs {
+                                        if let Some(packet) = packet_buffer.get(seq).await {
+                                            if packet.header.ssrc == local_ssrc {
+                                                if let Err(e) = local_track.write_rtp(&packet).await {
+                                                    error!("Failed to retransmit packet {}: {}", seq, e);
+                                                } else {
+                                                    retransmit_count += 1;
+                                                }
+                                            }
+                                        } else {
+                                            debug!("Packet {} not in buffer for retransmission", seq);
+                                        }
+                                    }
                                 }
                             }
                         }
+                        Err(_) => {
+                            exit_reason = "read_rtcp error";
+                            break;
+                        }
                     }
-                }
-                Err(_) => {
-                    // RTCP reading stopped, likely peer disconnected
-                    break;
                 }
             }
         }
 
-        if pli_count > 0 || nack_count > 0 {
-            info!(
-                "RTCP handler ended: {} PLIs, {} NACKs, {} retransmissions {} → {}",
-                pli_count, nack_count, retransmit_count, to_participant, from_participant
-            );
-        }
+        info!(
+            "RTCP handler ended: {} PLIs, {} NACKs, {} retransmissions {} → {} [reason: {}]",
+            pli_count, nack_count, retransmit_count, to_participant, from_participant, exit_reason
+        );
     }
 
     /// Remove all tracks for a participant (called when they leave)

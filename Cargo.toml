@@ -52,3 +52,6 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 # Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+
+# System info for memory debugging
+sysinfo = "0.32"
