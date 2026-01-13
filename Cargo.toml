@@ -5,16 +5,16 @@ edition = "2024"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # Web framework
-axum = { version = "0.8.7", features = ["ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = { version = "0.23", features = ["ring"] }
+axum = { version = "0.8.8", features = ["ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+rustls = { version = "0.23.36", features = ["ring"] }
 
 # CORS and middleware
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-tower = "0.5"
+tower-http = { version = "0.6.8", features = ["cors", "trace"] }
+tower = "0.5.3"
 
 # JSON serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -28,14 +28,14 @@ futures-util = "0.3"
 webrtc = "0.14"
 
 # Utilities
-uuid = { version = "1.10", features = ["v4", "serde"] }
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 
 # Database
-diesel = { version = "2.3.4", features = ["postgres", "uuid", "chrono"] }
+diesel = { version = "2.3.5", features = ["postgres", "uuid", "chrono"] }
 diesel-async = { version = "0.7.4", features = ["postgres", "deadpool"] }
 diesel_migrations = "2.2"
 
@@ -43,15 +43,18 @@ diesel_migrations = "2.2"
 argon2 = "0.5"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.9.2"
 
 # Logging
-tracing = "0.1.43"
+tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 # Metrics
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18.1"
 
 # System info for memory debugging
-sysinfo = "0.32"
+sysinfo = "0.37.2"
+
+# Memory allocator - returns memory to OS aggressively
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }

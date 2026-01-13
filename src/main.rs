@@ -1,3 +1,7 @@
+// Use jemalloc with aggressive memory return to OS
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod auth;
 mod db;
 mod schema;
