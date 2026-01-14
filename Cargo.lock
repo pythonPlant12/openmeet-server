@@ -1835,7 +1835,7 @@ dependencies = [
  "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",
- "rand 0.9.2",
+ "rand 0.8.5",
  "rustls",
  "serde",
  "serde_json",
