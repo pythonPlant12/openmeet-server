@@ -1,4 +1,7 @@
-use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{
+    password_hash::{SaltString, rand_core::OsRng},
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+};
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -7,7 +10,6 @@ use axum::{
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use rand::rngs::OsRng;
 
 use crate::auth::{
     jwt::JwtConfig,

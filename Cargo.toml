@@ -36,14 +36,14 @@ dotenvy = "0.15"
 
 # Database
 diesel = { version = "2.3.5", features = ["postgres", "uuid", "chrono"] }
-diesel-async = { version = "0.7.4", features = ["postgres", "deadpool"] }
+diesel-async = { version = "0.8.0", features = ["postgres", "deadpool"] }
 diesel_migrations = "2.2"
 
 # Auth
 argon2 = "0.5"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-sha2 = "0.10"
-rand = "0.8"
+sha2 = "0.11"
+rand = "0.10"
 
 # Logging
 tracing = "0.1.44"
@@ -54,7 +54,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18.1"
 
 # System info for memory debugging
-sysinfo = "0.37.2"
+sysinfo = "0.38.4"
 
 # Memory allocator - returns memory to OS aggressively
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }

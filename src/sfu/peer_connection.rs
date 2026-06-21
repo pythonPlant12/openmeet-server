@@ -67,6 +67,10 @@ impl PeerConnectionConfig {
 
     /// Add a STUN server
     pub fn with_stun_server(mut self, url: String) -> Self {
+        if self.ice_servers.iter().any(|server| server.urls.contains(&url)) {
+            return self;
+        }
+
         self.ice_servers.push(RTCIceServer {
             urls: vec![url],
             ..Default::default()
@@ -329,5 +333,13 @@ mod tests {
             config.ice_servers[0].urls[0],
             "stun:stun.l.google.com:19302"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stun_server_is_not_duplicated() {
+        let config = PeerConnectionConfig::default()
+            .with_stun_server("stun:stun.l.google.com:19302".to_string());
+
+        assert_eq!(config.ice_servers.len(), 1);
     }
 }
