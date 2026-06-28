@@ -1,9 +1,9 @@
+use crate::sfu::room::Room;
+use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use anyhow::Result;
-use crate::sfu::room::Room;
 
 /// Trait for room storage - allows easy swapping of implementations
 /// (in-memory now, Firebase/database later)

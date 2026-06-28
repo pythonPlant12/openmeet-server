@@ -1,6 +1,6 @@
-use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
 
 // Type alias for our async PostgreSQL connection pool
 pub type DbPool = Pool<AsyncPgConnection>;

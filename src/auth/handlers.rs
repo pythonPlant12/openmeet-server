@@ -1,16 +1,17 @@
 use argon2::{
-    password_hash::{SaltString, rand_core::OsRng},
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::OsRng},
 };
 use axum::{
-    extract::State,
-    http::{header, StatusCode},
     Json,
+    extract::State,
+    http::{StatusCode, header},
 };
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
+use crate::AppState;
 use crate::auth::{
     jwt::JwtConfig,
     models::{
@@ -19,7 +20,6 @@ use crate::auth::{
     },
 };
 use crate::schema::{refresh_tokens, users};
-use crate::AppState;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 
@@ -133,7 +133,12 @@ pub async fn refresh(
             ))
             .first(&mut conn)
             .await
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid refresh token".to_string()))?;
+            .map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid refresh token".to_string(),
+                )
+            })?;
 
     // Check expiration
     if expires_at < Utc::now().naive_utc() {
@@ -142,7 +147,10 @@ pub async fn refresh(
             .execute(&mut conn)
             .await
             .ok();
-        return Err((StatusCode::UNAUTHORIZED, "Refresh token expired".to_string()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Refresh token expired".to_string(),
+        ));
     }
 
     // Create new access token
@@ -235,12 +243,20 @@ fn extract_user_id(
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing authorization header".to_string()))?;
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Missing authorization header".to_string(),
+        ))?;
 
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or((StatusCode::UNAUTHORIZED, "Invalid authorization format".to_string()))?;
+    let token = auth_header.strip_prefix("Bearer ").ok_or((
+        StatusCode::UNAUTHORIZED,
+        "Invalid authorization format".to_string(),
+    ))?;
 
-    jwt.validate_access_token(token)
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid or expired token".to_string()))
+    jwt.validate_access_token(token).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Invalid or expired token".to_string(),
+        )
+    })
 }

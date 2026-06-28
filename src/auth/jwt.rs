@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -31,7 +31,10 @@ impl JwtConfig {
     }
 
     // Create short-lived JWT access token
-    pub fn create_access_token(&self, user_id: Uuid) -> Result<String, jsonwebtoken::errors::Error> {
+    pub fn create_access_token(
+        &self,
+        user_id: Uuid,
+    ) -> Result<String, jsonwebtoken::errors::Error> {
         let now = Utc::now();
         let claims = AccessClaims {
             sub: user_id.to_string(),

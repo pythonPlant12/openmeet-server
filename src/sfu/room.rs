@@ -1,23 +1,23 @@
+use crate::sfu::packet_buffer::RtpPacketBuffer;
+use crate::sfu::participant::ParticipantConnection;
+use crate::signaling::message::SignalingMessage;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use sysinfo::{System, Pid};
+use sysinfo::{Pid, System};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
 use webrtc::rtp::packet::Packet as RtpPacket;
-use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
-use webrtc::track::track_local::{ TrackLocal, TrackLocalWriter };
-use webrtc::track::track_remote::TrackRemote;
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
-use crate::sfu::participant::ParticipantConnection;
-use crate::sfu::packet_buffer::RtpPacketBuffer;
-use crate::signaling::message::SignalingMessage;
-use tracing::{ info, warn, error, debug };
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
+use webrtc::track::track_remote::TrackRemote;
 
 /// Broadcast channel capacity for RTP packets
 const RTP_BROADCAST_CAPACITY: usize = 256;
@@ -87,15 +87,22 @@ impl Room {
         let participant_id = participant.participant.id.clone();
         let participant_name = participant.participant.name.clone();
 
-        info!("Adding participant {} ({}) to room {}", participant_name, participant_id, self.id);
+        info!(
+            "Adding participant {} ({}) to room {}",
+            participant_name, participant_id, self.id
+        );
 
-        self.participants.insert(participant_id.clone(), participant);
+        self.participants
+            .insert(participant_id.clone(), participant);
 
         // Notify all other participants about the new joiner
-        self.broadcast_except(&participant_id, SignalingMessage::ParticipantJoined {
-            participant_id: participant_id.clone(),
-            participant_name,
-        });
+        self.broadcast_except(
+            &participant_id,
+            SignalingMessage::ParticipantJoined {
+                participant_id: participant_id.clone(),
+                participant_name,
+            },
+        );
 
         log_memory_usage(&format!("after adding participant {}", participant_id));
     }
@@ -103,7 +110,10 @@ impl Room {
     /// Remove a participant from the room
     pub async fn remove_participant(&mut self, participant_id: &str) {
         if let Some(participant_conn) = self.participants.remove(participant_id) {
-            info!("Removing participant {} from room {}", participant_id, self.id);
+            info!(
+                "Removing participant {} from room {}",
+                participant_id, self.id
+            );
 
             // Log Arc reference counts before cleanup
             if let Some(ref peer_conn) = participant_conn.peer_connection {
@@ -118,7 +128,10 @@ impl Room {
             if let Some(peer_conn) = participant_conn.get_peer_connection() {
                 let pc = peer_conn.lock().await;
                 if let Err(e) = pc.close().await {
-                    warn!("Error closing peer connection for {}: {}", participant_id, e);
+                    warn!(
+                        "Error closing peer connection for {}: {}",
+                        participant_id, e
+                    );
                 } else {
                     info!("Closed peer connection for {}", participant_id);
                 }
@@ -145,7 +158,12 @@ impl Room {
             let removed_track_ids = self
                 .participant_tracks
                 .get(participant_id)
-                .map(|tracks| tracks.iter().map(|track| track.track.id().to_string()).collect::<Vec<_>>())
+                .map(|tracks| {
+                    tracks
+                        .iter()
+                        .map(|track| track.track.id().to_string())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             self.remove_participant_tracks(participant_id);
 
@@ -181,7 +199,10 @@ impl Room {
 
             // participant_conn is dropped here, triggering Drop impl logging
         } else {
-            warn!("Tried to remove non-existent participant: {}", participant_id);
+            warn!(
+                "Tried to remove non-existent participant: {}",
+                participant_id
+            );
         }
     }
 
@@ -235,12 +256,14 @@ impl Room {
     pub fn get_participants_with_media_state(&self) -> Vec<(String, String, bool, bool)> {
         self.participants
             .iter()
-            .map(|(id, conn)| (
-                id.clone(),
-                conn.participant.name.clone(),
-                conn.participant.audio_enabled,
-                conn.participant.video_enabled,
-            ))
+            .map(|(id, conn)| {
+                (
+                    id.clone(),
+                    conn.participant.name.clone(),
+                    conn.participant.audio_enabled,
+                    conn.participant.video_enabled,
+                )
+            })
             .collect()
     }
 
@@ -258,11 +281,7 @@ impl Room {
 
         info!(
             "Room {}: Participant {} sent {} track (stream_id: {}, ssrc: {})",
-            self.id,
-            participant_id,
-            track_kind,
-            track_id,
-            sender_ssrc
+            self.id, participant_id, track_kind, track_id, sender_ssrc
         );
 
         // Create broadcast channel for this track - ONE reader broadcasts to ALL receivers
@@ -282,7 +301,8 @@ impl Room {
             .push(track_info);
 
         // Forward track to all other participants (passing the broadcaster)
-        self.forward_track_to_others(participant_id, track, sender_peer_connection, packet_tx).await;
+        self.forward_track_to_others(participant_id, track, sender_peer_connection, packet_tx)
+            .await;
     }
 
     /// Forward a track from one participant to all others in the room
@@ -299,14 +319,21 @@ impl Room {
         let sender_ssrc = track.ssrc();
 
         // Get sender info for StreamOwner message
-        let sender_name = self.participants
+        let sender_name = self
+            .participants
             .get(sender_id)
             .map(|p| p.participant.name.clone())
             .unwrap_or_else(|| "Unknown".to_string());
 
         // Collect receivers info before spawning tasks
         // Includes shutdown_rx so writer tasks can detect when receiver disconnects
-        let mut receivers: Vec<(String, Arc<TrackLocalStaticRTP>, Arc<RTCRtpSender>, u32, tokio::sync::watch::Receiver<()>)> = Vec::new();
+        let mut receivers: Vec<(
+            String,
+            Arc<TrackLocalStaticRTP>,
+            Arc<RTCRtpSender>,
+            u32,
+            tokio::sync::watch::Receiver<()>,
+        )> = Vec::new();
 
         for (participant_id, participant_conn) in &self.participants {
             if participant_id == sender_id {
@@ -437,7 +464,10 @@ impl Room {
                         packet_count += 1;
 
                         if packet_count % 500 == 0 {
-                            info!("Read {} {} packets FROM {}", packet_count, track_kind, from_id);
+                            info!(
+                                "Read {} {} packets FROM {}",
+                                packet_count, track_kind, from_id
+                            );
                         }
 
                         // Broadcast to all receivers (including future late joiners)
@@ -454,7 +484,10 @@ impl Room {
                 }
             }
 
-            info!("Reader task ended: {} {} packets FROM {}", packet_count, track_kind, from_id);
+            info!(
+                "Reader task ended: {} {} packets FROM {}",
+                packet_count, track_kind, from_id
+            );
         });
 
         // Spawn writer tasks for each current receiver (late joiners use subscribe_new_participant_to_track)
@@ -489,7 +522,8 @@ impl Room {
                         buffer_for_rtcp,
                         local_ssrc,
                         rtcp_shutdown_rx,
-                    ).await;
+                    )
+                    .await;
                 });
 
                 // Writer task: receives from broadcast and writes to local track
@@ -552,7 +586,10 @@ impl Room {
                         }
                     }
 
-                    info!("Writer task ended: {} {} packets {} → {} [reason: {}]", packet_count, kind, from_id, to_id, exit_reason);
+                    info!(
+                        "Writer task ended: {} {} packets {} → {} [reason: {}]",
+                        packet_count, kind, from_id, to_id, exit_reason
+                    );
                 });
             }
         }
@@ -560,14 +597,14 @@ impl Room {
 
     /// Create a local track for forwarding a remote track
     pub async fn create_forwarding_track(
-        remote_track: &Arc<TrackRemote>
+        remote_track: &Arc<TrackRemote>,
     ) -> Result<Arc<TrackLocalStaticRTP>, String> {
         let codec = remote_track.codec();
 
         let local_track = TrackLocalStaticRTP::new(
             codec.capability,
             format!("forwarded-{}", remote_track.id()),
-            remote_track.stream_id()
+            remote_track.stream_id(),
         );
 
         Ok(Arc::new(local_track))
@@ -617,7 +654,8 @@ impl Room {
                 buffer_for_rtcp,
                 local_ssrc,
                 rtcp_shutdown_rx,
-            ).await;
+            )
+            .await;
         });
 
         // Writer task: receives from broadcast and writes to local track
@@ -679,7 +717,10 @@ impl Room {
                 }
             }
 
-            info!("Late joiner writer ended: {} {} packets {} → {} [reason: {}]", packet_count, kind, from_id, to_id, exit_reason);
+            info!(
+                "Late joiner writer ended: {} {} packets {} → {} [reason: {}]",
+                packet_count, kind, from_id, to_id, exit_reason
+            );
         });
     }
 

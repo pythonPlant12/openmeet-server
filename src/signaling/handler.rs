@@ -1,7 +1,7 @@
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
         State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
     response::Response,
 };
@@ -12,13 +12,13 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::signaling::message::SignalingMessage;
 use crate::sfu::{
     participant::{Participant, ParticipantConnection},
     peer_connection::{PeerConnectionConfig, SfuPeerConnection},
     repository::RoomRepository,
     room::Room,
 };
+use crate::signaling::message::SignalingMessage;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
@@ -50,6 +50,10 @@ fn ice_candidate_type(candidate: &str) -> &str {
         .and_then(|index| parts.get(index + 1))
         .copied()
         .unwrap_or("unknown")
+}
+
+fn ice_candidate_protocol(candidate: &str) -> &str {
+    candidate.split_whitespace().nth(2).unwrap_or("unknown")
 }
 
 fn ice_candidate_address(candidate: &str) -> Option<&str> {
@@ -123,7 +127,10 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
                     }
                 }
                 Err(e) => {
-                    error!("✗ Serialize failed for {}: {}", participant_id_for_logging, e);
+                    error!(
+                        "✗ Serialize failed for {}: {}",
+                        participant_id_for_logging, e
+                    );
                 }
             }
         }
@@ -164,7 +171,10 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
                     }
                 }
                 Message::Close(_) => {
-                    info!("WebSocket closing for participant: {}", participant_id_clone);
+                    info!(
+                        "WebSocket closing for participant: {}",
+                        participant_id_clone
+                    );
                     break;
                 }
                 _ => {}
@@ -300,10 +310,9 @@ async fn handle_message(
                 }
 
                 // Configure UDP port range if both UDP_PORT_MIN and UDP_PORT_MAX are set
-                if let (Ok(min_str), Ok(max_str)) = (
-                    std::env::var("UDP_PORT_MIN"),
-                    std::env::var("UDP_PORT_MAX"),
-                ) {
+                if let (Ok(min_str), Ok(max_str)) =
+                    (std::env::var("UDP_PORT_MIN"), std::env::var("UDP_PORT_MAX"))
+                {
                     if let (Ok(min), Ok(max)) = (min_str.parse::<u16>(), max_str.parse::<u16>()) {
                         config = config.with_udp_port_range(min, max);
                     }
@@ -332,7 +341,7 @@ async fn handle_message(
                     .ice_servers
                     .iter()
                     .flat_map(|server| server.urls.iter())
-                    .filter(|url| url.starts_with("turn:" ) || url.starts_with("turns:"))
+                    .filter(|url| url.starts_with("turn:") || url.starts_with("turns:"))
                     .map(|url| turn_url_host(url).to_string())
                     .collect();
 
@@ -354,7 +363,10 @@ async fn handle_message(
                     );
                 }
 
-                if turn_hosts.iter().any(|host| host == "localhost" || host == "127.0.0.1") {
+                if turn_hosts
+                    .iter()
+                    .any(|host| host == "localhost" || host == "127.0.0.1")
+                {
                     warn!(
                         "TURN host for {} resolves to loopback. This only works for same-machine browser tests.",
                         participant_id
@@ -372,7 +384,8 @@ async fn handle_message(
                             let tx_ice = tx.clone();
                             let participant_id_ice = participant_id.to_string();
                             let room_id_ice = room_id.clone();
-                            let candidate_counts = Arc::new(StdMutex::new(CandidateTypeCounts::default()));
+                            let candidate_counts =
+                                Arc::new(StdMutex::new(CandidateTypeCounts::default()));
                             let candidate_counts_for_handler = Arc::clone(&candidate_counts);
 
                             raw_pc.on_ice_candidate(Box::new(move |candidate| {
@@ -472,7 +485,13 @@ async fn handle_message(
                                 tokio::spawn(async move {
                                     if let Some(room_lock) = Some(room_lock) {
                                         let mut room = room_lock.write().await;
-                                        room.handle_incoming_track(&participant_id, track, receiver, sender_pc).await;
+                                        room.handle_incoming_track(
+                                            &participant_id,
+                                            track,
+                                            receiver,
+                                            sender_pc,
+                                        )
+                                        .await;
                                     }
                                 });
                             });
@@ -482,7 +501,10 @@ async fn handle_message(
                         participant_conn.set_peer_connection(peer_conn);
                     }
                     Err(e) => {
-                        error!("Failed to create peer connection for {}: {}", participant_id, e);
+                        error!(
+                            "Failed to create peer connection for {}: {}",
+                            participant_id, e
+                        );
                         // Metrics: peer connection failed
                         counter!("sfu_peer_connection_failures_total").increment(1);
                         let _ = tx.send(SignalingMessage::Error {
@@ -566,44 +588,74 @@ async fn handle_message(
                                             // After initial connection, send existing tracks via renegotiation
                                             // This is more reliable than adding tracks in the initial answer
                                             // Clone the track info for use in async task (sender_id, track, sender_peer_connection, sender_ssrc, packet_broadcaster)
-                                            let existing_tracks: Vec<(String, Vec<(Arc<TrackRemote>, Arc<webrtc::peer_connection::RTCPeerConnection>, u32, tokio::sync::broadcast::Sender<webrtc::rtp::packet::Packet>)>)> = room
-                                                .participant_tracks
-                                                .iter()
-                                                .filter(|(id, _)| *id != participant_id)
-                                                .map(|(id, tracks)| (
-                                                    id.clone(),
-                                                    tracks.iter().map(|info| (
+                                            let existing_tracks: Vec<(
+                                                String,
+                                                Vec<(
+                                                    Arc<TrackRemote>,
+                                                    Arc<webrtc::peer_connection::RTCPeerConnection>,
+                                                    u32,
+                                                    tokio::sync::broadcast::Sender<
+                                                        webrtc::rtp::packet::Packet,
+                                                    >,
+                                                )>,
+                                            )> =
+                                                room.participant_tracks
+                                                    .iter()
+                                                    .filter(|(id, _)| *id != participant_id)
+                                                    .map(|(id, tracks)| {
+                                                        (
+                                                            id.clone(),
+                                                            tracks
+                                                                .iter()
+                                                                .map(|info| {
+                                                                    (
                                                         Arc::clone(&info.track),
                                                         Arc::clone(&info.sender_peer_connection),
                                                         info.sender_ssrc,
                                                         info.packet_broadcaster.clone(),
-                                                    )).collect()
-                                                ))
-                                                .collect();
+                                                    )
+                                                                })
+                                                                .collect(),
+                                                        )
+                                                    })
+                                                    .collect();
 
                                             if !existing_tracks.is_empty() {
                                                 let peer_conn_for_renego = Arc::clone(&peer_conn);
                                                 let tx_for_renego = tx.clone();
-                                                let participant_id_for_renego = participant_id.to_string();
-                                                let pending_negotiated_tracks_ref = Arc::clone(&room.pending_negotiated_tracks);
+                                                let participant_id_for_renego =
+                                                    participant_id.to_string();
+                                                let pending_negotiated_tracks_ref =
+                                                    Arc::clone(&room.pending_negotiated_tracks);
 
                                                 // Get the late joiner's shutdown receiver - used to stop writer tasks when they disconnect
-                                                let shutdown_rx_for_late_joiner = participant_conn.get_shutdown_receiver();
+                                                let shutdown_rx_for_late_joiner =
+                                                    participant_conn.get_shutdown_receiver();
 
                                                 // Collect sender info for StreamOwner messages
-                                                let sender_info: std::collections::HashMap<String, String> = room.participants
+                                                let sender_info: std::collections::HashMap<
+                                                    String,
+                                                    String,
+                                                > = room
+                                                    .participants
                                                     .iter()
-                                                    .map(|(id, conn)| (id.clone(), conn.participant.name.clone()))
+                                                    .map(|(id, conn)| {
+                                                        (id.clone(), conn.participant.name.clone())
+                                                    })
                                                     .collect();
 
                                                 info!(
                                                     "Will send {} existing tracks to {} via renegotiation",
-                                                    existing_tracks.iter().map(|(_, tracks)| tracks.len()).sum::<usize>(),
+                                                    existing_tracks
+                                                        .iter()
+                                                        .map(|(_, tracks)| tracks.len())
+                                                        .sum::<usize>(),
                                                     participant_id
                                                 );
 
                                                 tokio::spawn(async move {
-                                                    let peer_conn_lock = peer_conn_for_renego.lock().await;
+                                                    let peer_conn_lock =
+                                                        peer_conn_for_renego.lock().await;
                                                     let pc = peer_conn_lock.get_peer_connection();
 
                                                     use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
@@ -611,24 +663,67 @@ async fn handle_message(
                                                     use webrtc::peer_connection::RTCPeerConnection;
 
                                                     // Include sender_peer_connection, sender_ssrc, and packet_broadcaster for late joiner subscription
-                                                    let mut pending_forwards: Vec<(Arc<TrackRemote>, Arc<TrackLocalStaticRTP>, Arc<RTCRtpSender>, String, String, Arc<RTCPeerConnection>, u32, tokio::sync::broadcast::Sender<webrtc::rtp::packet::Packet>)> = Vec::new();
+                                                    let mut pending_forwards: Vec<(
+                                                        Arc<TrackRemote>,
+                                                        Arc<TrackLocalStaticRTP>,
+                                                        Arc<RTCRtpSender>,
+                                                        String,
+                                                        String,
+                                                        Arc<RTCPeerConnection>,
+                                                        u32,
+                                                        tokio::sync::broadcast::Sender<
+                                                            webrtc::rtp::packet::Packet,
+                                                        >,
+                                                    )> = Vec::new();
 
                                                     // Add all existing tracks to peer connection
-                                                    for (sender_id, track_tuples) in existing_tracks {
+                                                    for (sender_id, track_tuples) in existing_tracks
+                                                    {
                                                         // Send StreamOwner for each sender's stream
-                                                        if let Some((first_track, _, _, _)) = track_tuples.first() {
-                                                            let sender_name = sender_info.get(&sender_id).cloned().unwrap_or_else(|| "Unknown".to_string());
-                                                            let _ = tx_for_renego.send(SignalingMessage::StreamOwner {
-                                                                stream_id: first_track.stream_id(),
-                                                                participant_id: sender_id.clone(),
-                                                                participant_name: sender_name,
-                                                            });
+                                                        if let Some((first_track, _, _, _)) =
+                                                            track_tuples.first()
+                                                        {
+                                                            let sender_name = sender_info
+                                                                .get(&sender_id)
+                                                                .cloned()
+                                                                .unwrap_or_else(|| {
+                                                                    "Unknown".to_string()
+                                                                });
+                                                            let _ = tx_for_renego.send(
+                                                                SignalingMessage::StreamOwner {
+                                                                    stream_id: first_track
+                                                                        .stream_id(),
+                                                                    participant_id: sender_id
+                                                                        .clone(),
+                                                                    participant_name: sender_name,
+                                                                },
+                                                            );
                                                         }
 
-                                                        for (track, sender_pc, sender_ssrc, packet_broadcaster) in track_tuples {
-                                                            match Room::create_forwarding_track(&track).await {
+                                                        for (
+                                                            track,
+                                                            sender_pc,
+                                                            sender_ssrc,
+                                                            packet_broadcaster,
+                                                        ) in track_tuples
+                                                        {
+                                                            match Room::create_forwarding_track(
+                                                                &track,
+                                                            )
+                                                            .await
+                                                            {
                                                                 Ok(local_track) => {
-                                                                    match pc.add_track(Arc::clone(&local_track) as Arc<dyn TrackLocal + Send + Sync>).await {
+                                                                    match pc
+                                                                        .add_track(Arc::clone(
+                                                                            &local_track,
+                                                                        )
+                                                                            as Arc<
+                                                                                dyn TrackLocal
+                                                                                    + Send
+                                                                                    + Sync,
+                                                                            >)
+                                                                        .await
+                                                                    {
                                                                         Ok(rtp_sender) => {
                                                                             info!(
                                                                                 "Added existing {} track from {} to {}",
@@ -636,24 +731,36 @@ async fn handle_message(
                                                                                 sender_id,
                                                                                 participant_id_for_renego
                                                                             );
-                                                                            pending_forwards.push((
+                                                                            pending_forwards
+                                                                                .push((
                                                                                 Arc::clone(&track),
                                                                                 local_track,
                                                                                 rtp_sender,
-                                                                                sender_id.to_string(),
-                                                                                track.id().to_string(),
-                                                                                Arc::clone(&sender_pc),
+                                                                                sender_id
+                                                                                    .to_string(),
+                                                                                track
+                                                                                    .id()
+                                                                                    .to_string(),
+                                                                                Arc::clone(
+                                                                                    &sender_pc,
+                                                                                ),
                                                                                 sender_ssrc,
                                                                                 packet_broadcaster,
                                                                             ));
                                                                         }
                                                                         Err(e) => {
-                                                                            error!("Failed to add track: {}", e);
+                                                                            error!(
+                                                                                "Failed to add track: {}",
+                                                                                e
+                                                                            );
                                                                         }
                                                                     }
                                                                 }
                                                                 Err(e) => {
-                                                                    error!("Failed to create forwarding track: {}", e);
+                                                                    error!(
+                                                                        "Failed to create forwarding track: {}",
+                                                                        e
+                                                                    );
                                                                 }
                                                             }
                                                         }
@@ -666,8 +773,11 @@ async fn handle_message(
                                                     // the added tracks can remain on the PeerConnection without a matching offer.
                                                     let mut offer_result = None;
                                                     for attempt in 1..=5 {
-                                                        let peer_conn_lock = peer_conn_for_renego.lock().await;
-                                                        let result = peer_conn_lock.create_offer_if_stable().await;
+                                                        let peer_conn_lock =
+                                                            peer_conn_for_renego.lock().await;
+                                                        let result = peer_conn_lock
+                                                            .create_offer_if_stable()
+                                                            .await;
                                                         drop(peer_conn_lock);
 
                                                         match result {
@@ -676,7 +786,11 @@ async fn handle_message(
                                                                 break;
                                                             }
                                                             Ok(None) => {
-                                                                info!("Skipping renegotiation for {} - collision, retry attempt {}", participant_id_for_renego, attempt);
+                                                                info!(
+                                                                    "Skipping renegotiation for {} - collision, retry attempt {}",
+                                                                    participant_id_for_renego,
+                                                                    attempt
+                                                                );
                                                                 tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
                                                             }
                                                             Err(e) => {
@@ -688,33 +802,69 @@ async fn handle_message(
 
                                                     match offer_result {
                                                         Some(Ok(offer)) => {
-                                                            info!("Sending renegotiation offer to {} with {} tracks", participant_id_for_renego, pending_forwards.len());
-                                                            if let Err(e) = tx_for_renego.send(SignalingMessage::Offer {
-                                                                target_id: participant_id_for_renego.clone(),
-                                                                sdp: offer.sdp,
-                                                            }) {
-                                                                warn!("Failed to queue renegotiation offer to {}: {}", participant_id_for_renego, e);
+                                                            info!(
+                                                                "Sending renegotiation offer to {} with {} tracks",
+                                                                participant_id_for_renego,
+                                                                pending_forwards.len()
+                                                            );
+                                                            if let Err(e) =
+                                                                tx_for_renego
+                                                                    .send(SignalingMessage::Offer {
+                                                                    target_id:
+                                                                        participant_id_for_renego
+                                                                            .clone(),
+                                                                    sdp: offer.sdp,
+                                                                })
+                                                            {
+                                                                warn!(
+                                                                    "Failed to queue renegotiation offer to {}: {}",
+                                                                    participant_id_for_renego, e
+                                                                );
                                                                 return;
                                                             }
 
                                                             // Mark tracks as pending and start RTP forwarding via broadcast subscription.
                                                             // They become negotiated only after the client answers this server offer.
-                                                            let mut pending = pending_negotiated_tracks_ref.write().await;
-                                                            for (track_remote, local_track, rtp_sender, from_id, track_id, sender_pc, sender_ssrc, packet_broadcaster) in pending_forwards {
+                                                            let mut pending =
+                                                                pending_negotiated_tracks_ref
+                                                                    .write()
+                                                                    .await;
+                                                            for (
+                                                                track_remote,
+                                                                local_track,
+                                                                rtp_sender,
+                                                                from_id,
+                                                                track_id,
+                                                                sender_pc,
+                                                                sender_ssrc,
+                                                                packet_broadcaster,
+                                                            ) in pending_forwards
+                                                            {
                                                                 pending
                                                                     .entry(participant_id_for_renego.clone())
                                                                     .or_insert_with(std::collections::HashSet::new)
                                                                     .insert(track_id.clone());
 
-                                                                let track_kind = track_remote.kind();
-                                                                let to_id = participant_id_for_renego.clone();
+                                                                let track_kind =
+                                                                    track_remote.kind();
+                                                                let to_id =
+                                                                    participant_id_for_renego
+                                                                        .clone();
                                                                 let from_id_clone = from_id.clone();
 
                                                                 // Get local SSRC for this sender
-                                                                let local_ssrc = match rtp_sender.get_parameters().await.encodings.first() {
+                                                                let local_ssrc = match rtp_sender
+                                                                    .get_parameters()
+                                                                    .await
+                                                                    .encodings
+                                                                    .first()
+                                                                {
                                                                     Some(encoding) => encoding.ssrc,
                                                                     None => {
-                                                                        error!("No SSRC found for RTP sender to {}", to_id);
+                                                                        error!(
+                                                                            "No SSRC found for RTP sender to {}",
+                                                                            to_id
+                                                                        );
                                                                         continue;
                                                                     }
                                                                 };
@@ -748,17 +898,26 @@ async fn handle_message(
                                                             }
                                                         }
                                                         None => {
-                                                            warn!("Failed to send renegotiation offer to {} after collision retries", participant_id_for_renego);
+                                                            warn!(
+                                                                "Failed to send renegotiation offer to {} after collision retries",
+                                                                participant_id_for_renego
+                                                            );
                                                         }
                                                         Some(Err(e)) => {
-                                                            error!("Failed to create renegotiation offer for {}: {}", participant_id_for_renego, e);
+                                                            error!(
+                                                                "Failed to create renegotiation offer for {}: {}",
+                                                                participant_id_for_renego, e
+                                                            );
                                                         }
                                                     }
                                                 });
                                             }
                                         }
                                         Err(e) => {
-                                            error!("Failed to create answer for {}: {}", participant_id, e);
+                                            error!(
+                                                "Failed to create answer for {}: {}",
+                                                participant_id, e
+                                            );
                                             let _ = tx.send(SignalingMessage::Error {
                                                 message: format!("Failed to create answer: {}", e),
                                             });
@@ -766,7 +925,10 @@ async fn handle_message(
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Failed to set remote description for {}: {}", participant_id, e);
+                                    error!(
+                                        "Failed to set remote description for {}: {}",
+                                        participant_id, e
+                                    );
                                     let _ = tx.send(SignalingMessage::Error {
                                         message: format!("Failed to process offer: {}", e),
                                     });
@@ -807,12 +969,16 @@ async fn handle_message(
 
                                         // Promote tracks from the answered server offer into the negotiated set.
                                         let pending_track_ids = {
-                                            let mut pending = room.pending_negotiated_tracks.write().await;
-                                            pending.remove(&participant_id_for_retry).unwrap_or_default()
+                                            let mut pending =
+                                                room.pending_negotiated_tracks.write().await;
+                                            pending
+                                                .remove(&participant_id_for_retry)
+                                                .unwrap_or_default()
                                         };
 
                                         if !pending_track_ids.is_empty() {
-                                            let mut negotiated = room.negotiated_tracks.write().await;
+                                            let mut negotiated =
+                                                room.negotiated_tracks.write().await;
                                             negotiated
                                                 .entry(participant_id_for_retry.clone())
                                                 .or_insert_with(std::collections::HashSet::new)
@@ -838,44 +1004,73 @@ async fn handle_message(
 
                                         let missing_track_ids: Vec<String> = all_track_ids
                                             .iter()
-                                            .filter(|track_id| !already_negotiated.contains(*track_id))
+                                            .filter(|track_id| {
+                                                !already_negotiated.contains(*track_id)
+                                            })
                                             .cloned()
                                             .collect();
 
                                         if !missing_track_ids.is_empty() {
-                                            info!("🔄 Retrying for {} - {} tracks pending: {:?}",
-                                                participant_id_for_retry, missing_track_ids.len(), missing_track_ids);
+                                            info!(
+                                                "🔄 Retrying for {} - {} tracks pending: {:?}",
+                                                participant_id_for_retry,
+                                                missing_track_ids.len(),
+                                                missing_track_ids
+                                            );
 
                                             // Send new offer including pending tracks
                                             match peer_conn_lock.create_offer_if_stable().await {
                                                 Ok(Some(offer)) => {
-                                                    info!("✓ Retry offer sent for {}", participant_id_for_retry);
-                                                    if let Err(e) = tx_for_retry.send(SignalingMessage::Offer {
-                                                        target_id: participant_id_for_retry.clone(),
-                                                        sdp: offer.sdp,
-                                                    }) {
-                                                        warn!("Failed to queue retry offer to {}: {}", participant_id_for_retry, e);
+                                                    info!(
+                                                        "✓ Retry offer sent for {}",
+                                                        participant_id_for_retry
+                                                    );
+                                                    if let Err(e) =
+                                                        tx_for_retry.send(SignalingMessage::Offer {
+                                                            target_id: participant_id_for_retry
+                                                                .clone(),
+                                                            sdp: offer.sdp,
+                                                        })
+                                                    {
+                                                        warn!(
+                                                            "Failed to queue retry offer to {}: {}",
+                                                            participant_id_for_retry, e
+                                                        );
                                                         return;
                                                     }
 
                                                     // Mark these tracks pending until the client answers this retry offer.
-                                                    let mut pending = room.pending_negotiated_tracks.write().await;
+                                                    let mut pending = room
+                                                        .pending_negotiated_tracks
+                                                        .write()
+                                                        .await;
                                                     for track_id in missing_track_ids {
                                                         pending
                                                             .entry(participant_id_for_retry.clone())
-                                                            .or_insert_with(std::collections::HashSet::new)
+                                                            .or_insert_with(
+                                                                std::collections::HashSet::new,
+                                                            )
                                                             .insert(track_id);
                                                     }
                                                 }
                                                 Ok(None) => {
-                                                    info!("⚠ Still in collision for {}, will retry on next answer", participant_id_for_retry);
+                                                    info!(
+                                                        "⚠ Still in collision for {}, will retry on next answer",
+                                                        participant_id_for_retry
+                                                    );
                                                 }
                                                 Err(e) => {
-                                                    error!("✗ Retry failed for {}: {}", participant_id_for_retry, e);
+                                                    error!(
+                                                        "✗ Retry failed for {}: {}",
+                                                        participant_id_for_retry, e
+                                                    );
                                                 }
                                             }
                                         } else {
-                                            info!("✓ All tracks negotiated to {}", participant_id_for_retry);
+                                            info!(
+                                                "✓ All tracks negotiated to {}",
+                                                participant_id_for_retry
+                                            );
                                         }
                                     });
                                 }
@@ -907,16 +1102,28 @@ async fn handle_message(
 
                             // Add ICE candidate to peer connection
                             match peer_conn_lock
-                                .add_ice_candidate(candidate.clone(), sdp_mid.clone(), sdp_m_line_index)
+                                .add_ice_candidate(
+                                    candidate.clone(),
+                                    sdp_mid.clone(),
+                                    sdp_m_line_index,
+                                )
                                 .await
                             {
                                 Ok(_) => {
-                                    info!("Added ICE candidate for participant {}", participant_id);
+                                    info!(
+                                        "Added ICE candidate for participant {}: typ={}, protocol={}",
+                                        participant_id,
+                                        ice_candidate_type(&candidate),
+                                        ice_candidate_protocol(&candidate)
+                                    );
                                     // Metrics: ICE candidate received
                                     counter!("sfu_ice_candidates_received_total").increment(1);
                                 }
                                 Err(e) => {
-                                    error!("Failed to add ICE candidate for {}: {}", participant_id, e);
+                                    error!(
+                                        "Failed to add ICE candidate for {}: {}",
+                                        participant_id, e
+                                    );
                                 }
                             }
                         } else {
@@ -943,12 +1150,18 @@ async fn handle_message(
                         participant_conn.participant.video_enabled = video_enabled;
                     }
 
-                    info!("📢 {} toggled media: audio={}, video={}", participant_id, audio_enabled, video_enabled);
-                    room.broadcast_except(participant_id, SignalingMessage::MediaStateChanged {
-                        participant_id: participant_id.to_string(),
-                        audio_enabled,
-                        video_enabled,
-                    });
+                    info!(
+                        "📢 {} toggled media: audio={}, video={}",
+                        participant_id, audio_enabled, video_enabled
+                    );
+                    room.broadcast_except(
+                        participant_id,
+                        SignalingMessage::MediaStateChanged {
+                            participant_id: participant_id.to_string(),
+                            audio_enabled,
+                            video_enabled,
+                        },
+                    );
                 }
             }
         }
@@ -963,7 +1176,9 @@ async fn handle_message(
             if let Some(room_id) = current_room_id {
                 if let Some(room_lock) = room_repo.get_room(room_id).await {
                     let room = room_lock.read().await;
-                    let sender_name = participant_name.clone().unwrap_or_else(|| "Unknown".to_string());
+                    let sender_name = participant_name
+                        .clone()
+                        .unwrap_or_else(|| "Unknown".to_string());
 
                     info!("💬 {} sent message in room {}", sender_name, room_id);
                     room.broadcast(SignalingMessage::ChatMessage {

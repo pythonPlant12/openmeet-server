@@ -20,17 +20,11 @@ pub enum SignalingMessage {
 
     /// WebRTC offer from client to server (or server to client)
     #[serde(rename_all = "camelCase")]
-    Offer {
-        target_id: String,
-        sdp: String,
-    },
+    Offer { target_id: String, sdp: String },
 
     /// WebRTC answer in response to offer
     #[serde(rename_all = "camelCase")]
-    Answer {
-        target_id: String,
-        sdp: String,
-    },
+    Answer { target_id: String, sdp: String },
 
     /// ICE candidate for NAT traversal
     #[serde(rename_all = "camelCase")]
@@ -50,9 +44,7 @@ pub enum SignalingMessage {
 
     /// Notify when a participant leaves the room
     #[serde(rename_all = "camelCase")]
-    ParticipantLeft {
-        participant_id: String,
-    },
+    ParticipantLeft { participant_id: String },
 
     /// Maps a stream ID to its owner participant
     #[serde(rename_all = "camelCase")]
@@ -80,9 +72,7 @@ pub enum SignalingMessage {
     },
 
     /// Error message from server
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 #[cfg(test)]

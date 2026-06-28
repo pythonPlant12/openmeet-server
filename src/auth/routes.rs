@@ -1,10 +1,10 @@
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 
-use crate::auth::{login, logout, me, refresh, register};
 use crate::AppState;
+use crate::auth::{login, logout, me, refresh, register};
 
 pub fn auth_routes() -> Router<AppState> {
     Router::new()

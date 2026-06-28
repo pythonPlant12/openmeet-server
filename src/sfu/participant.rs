@@ -1,8 +1,8 @@
-use tokio::sync::{mpsc, watch, Mutex};
-use std::sync::Arc;
-use tracing::info;
-use crate::signaling::message::SignalingMessage;
 use crate::sfu::peer_connection::SfuPeerConnection;
+use crate::signaling::message::SignalingMessage;
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc, watch};
+use tracing::info;
 
 /// Represents a participant in a video conference room
 #[derive(Debug, Clone)]
@@ -86,7 +86,11 @@ impl Drop for ParticipantConnection {
             "DROP ParticipantConnection: {} ({}), peer_connection={}",
             self.participant.name,
             self.participant.id,
-            if self.peer_connection.is_some() { "present" } else { "none" }
+            if self.peer_connection.is_some() {
+                "present"
+            } else {
+                "none"
+            }
         );
     }
 }

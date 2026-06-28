@@ -5,13 +5,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod auth;
 mod db;
 mod schema;
-mod signaling;
 mod sfu;
+mod signaling;
 
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 use diesel::{Connection, PgConnection};
-use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -19,10 +19,10 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
-use crate::auth::{auth_routes, JwtConfig};
-use crate::db::{create_pool, DbPool};
-use crate::signaling::handler::websocket_handler;
+use crate::auth::{JwtConfig, auth_routes};
+use crate::db::{DbPool, create_pool};
 use crate::sfu::repository::{InMemoryRoomRepository, RoomRepository};
+use crate::signaling::handler::websocket_handler;
 
 // Embed migrations at compile time
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
@@ -117,10 +117,12 @@ async fn main() {
 
     if use_tls {
         let cert_path = PathBuf::from(
-            std::env::var("SSL_CERT_PATH").unwrap_or_else(|_| "../certs/localhost+3.pem".to_string()),
+            std::env::var("SSL_CERT_PATH")
+                .unwrap_or_else(|_| "../certs/localhost+3.pem".to_string()),
         );
         let key_path = PathBuf::from(
-            std::env::var("SSL_KEY_PATH").unwrap_or_else(|_| "../certs/localhost+3-key.pem".to_string()),
+            std::env::var("SSL_KEY_PATH")
+                .unwrap_or_else(|_| "../certs/localhost+3-key.pem".to_string()),
         );
         let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path)
             .await
@@ -148,8 +150,6 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-async fn metrics_handler(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> String {
+async fn metrics_handler(axum::extract::State(state): axum::extract::State<AppState>) -> String {
     state.metrics_handle.render()
 }

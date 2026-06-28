@@ -2,19 +2,19 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice::udp_network::{EphemeralUDP, UDPNetwork};
-use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
+use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::track::track_remote::TrackRemote;
 
@@ -56,8 +56,13 @@ impl PeerConnectionConfig {
 
     /// Add a TURN server for NAT traversal (required for users behind symmetric NAT)
     pub fn with_turn_server(mut self, url: String, username: String, credential: String) -> Self {
+        let mut urls = vec![url.clone()];
+        if let Some(tcp_url) = turn_tcp_variant(&url) {
+            urls.push(tcp_url);
+        }
+
         self.ice_servers.push(RTCIceServer {
-            urls: vec![url],
+            urls,
             username,
             credential,
             ..Default::default()
@@ -67,7 +72,11 @@ impl PeerConnectionConfig {
 
     /// Add a STUN server
     pub fn with_stun_server(mut self, url: String) -> Self {
-        if self.ice_servers.iter().any(|server| server.urls.contains(&url)) {
+        if self
+            .ice_servers
+            .iter()
+            .any(|server| server.urls.contains(&url))
+        {
             return self;
         }
 
@@ -77,6 +86,14 @@ impl PeerConnectionConfig {
         });
         self
     }
+}
+
+fn turn_tcp_variant(url: &str) -> Option<String> {
+    if !url.starts_with("turn:") || url.contains('?') {
+        return None;
+    }
+
+    Some(format!("{}?transport=tcp", url))
 }
 
 /// Wrapper around RTCPeerConnection with SFU-specific logic
@@ -91,7 +108,10 @@ impl SfuPeerConnection {
         participant_id: String,
         config: PeerConnectionConfig,
     ) -> Result<Arc<Mutex<Self>>> {
-        info!("Creating peer connection for participant: {}", participant_id);
+        info!(
+            "Creating peer connection for participant: {}",
+            participant_id
+        );
 
         // Create media engine with default codecs
         let mut media_engine = MediaEngine::default();
@@ -100,7 +120,8 @@ impl SfuPeerConnection {
         // Create interceptor registry with default interceptors
         // This enables NACK (retransmission) and PLI (keyframe request) handling
         let mut interceptor_registry = Registry::new();
-        interceptor_registry = register_default_interceptors(interceptor_registry, &mut media_engine)?;
+        interceptor_registry =
+            register_default_interceptors(interceptor_registry, &mut media_engine)?;
 
         // Create setting engine for NAT traversal configuration
         let mut setting_engine = SettingEngine::default();
@@ -155,8 +176,8 @@ impl SfuPeerConnection {
         let participant_id_clone = participant_id.to_string();
 
         // Handle ICE connection state changes
-        peer_connection
-            .on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
+        peer_connection.on_ice_connection_state_change(Box::new(
+            move |state: RTCIceConnectionState| {
                 let participant_id = participant_id_clone.clone();
                 Box::pin(async move {
                     info!(
@@ -166,7 +187,10 @@ impl SfuPeerConnection {
 
                     match state {
                         RTCIceConnectionState::Failed | RTCIceConnectionState::Disconnected => {
-                            warn!("Participant {} connection issues: {:?}", participant_id, state);
+                            warn!(
+                                "Participant {} connection issues: {:?}",
+                                participant_id, state
+                            );
                         }
                         RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
                             info!("Participant {} successfully connected", participant_id);
@@ -174,13 +198,14 @@ impl SfuPeerConnection {
                         _ => {}
                     }
                 })
-            }));
+            },
+        ));
 
         let participant_id_clone = participant_id.to_string();
 
         // Handle peer connection state changes
-        peer_connection
-            .on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+        peer_connection.on_peer_connection_state_change(Box::new(
+            move |state: RTCPeerConnectionState| {
                 let participant_id = participant_id_clone.clone();
                 Box::pin(async move {
                     debug!(
@@ -192,7 +217,8 @@ impl SfuPeerConnection {
                         error!("Participant {} peer connection failed", participant_id);
                     }
                 })
-            }));
+            },
+        ));
     }
 
     /// Set remote description (offer or answer from client)
@@ -241,8 +267,7 @@ impl SfuPeerConnection {
         if signaling_state != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable {
             info!(
                 "Participant {} signaling state is {:?}, skipping renegotiation offer to avoid collision",
-                self.participant_id,
-                signaling_state
+                self.participant_id, signaling_state
             );
             return Ok(None);
         }
@@ -259,7 +284,12 @@ impl SfuPeerConnection {
     }
 
     /// Add an ICE candidate received from the client
-    pub async fn add_ice_candidate(&self, candidate: String, sdp_mid: Option<String>, sdp_m_line_index: Option<u16>) -> Result<()> {
+    pub async fn add_ice_candidate(
+        &self,
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_m_line_index: Option<u16>,
+    ) -> Result<()> {
         debug!(
             "Adding ICE candidate for participant {}: {}",
             self.participant_id, candidate
@@ -272,7 +302,9 @@ impl SfuPeerConnection {
             username_fragment: None,
         };
 
-        self.peer_connection.add_ice_candidate(ice_candidate).await?;
+        self.peer_connection
+            .add_ice_candidate(ice_candidate)
+            .await?;
 
         Ok(())
     }
@@ -299,7 +331,10 @@ impl SfuPeerConnection {
 
     /// Close the peer connection
     pub async fn close(&self) -> Result<()> {
-        info!("Closing peer connection for participant {}", self.participant_id);
+        info!(
+            "Closing peer connection for participant {}",
+            self.participant_id
+        );
         self.peer_connection.close().await?;
         Ok(())
     }
@@ -313,6 +348,32 @@ impl SfuPeerConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_tcp_variant_adds_tcp_transport_to_plain_turn_url() {
+        assert_eq!(
+            turn_tcp_variant("turn:turn.openmeets.eu:3478"),
+            Some("turn:turn.openmeets.eu:3478?transport=tcp".to_string())
+        );
+    }
+
+    #[test]
+    fn turn_tcp_variant_skips_urls_with_explicit_transport() {
+        assert_eq!(
+            turn_tcp_variant("turn:turn.openmeets.eu:3478?transport=udp"),
+            None
+        );
+
+        assert_eq!(
+            turn_tcp_variant("turn:turn.openmeets.eu:3478?foo=bar"),
+            None
+        );
+    }
+
+    #[test]
+    fn turn_tcp_variant_skips_turns_urls_until_tls_is_configured() {
+        assert_eq!(turn_tcp_variant("turns:turn.openmeets.eu:5349"), None);
+    }
 
     #[tokio::test]
     async fn test_create_peer_connection() {
