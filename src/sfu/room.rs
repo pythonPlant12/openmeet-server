@@ -4,6 +4,7 @@ use std::sync::Arc;
 use sysinfo::{System, Pid};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tokio::time::{Duration, Instant};
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
@@ -20,6 +21,7 @@ use tracing::{ info, warn, error, debug };
 
 /// Broadcast channel capacity for RTP packets
 const RTP_BROADCAST_CAPACITY: usize = 256;
+const LOSS_RECOVERY_PLI_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Log current process memory usage
 fn log_memory_usage(context: &str) {
@@ -682,6 +684,29 @@ impl Room {
     }
 
     /// Handle RTCP feedback from receivers and forward PLI/NACK to the original sender
+    async fn send_pli_to_sender(
+        sender_peer_connection: &Arc<RTCPeerConnection>,
+        sender_ssrc: u32,
+        from_participant: &str,
+        to_participant: &str,
+        reason: &str,
+    ) -> bool {
+        let pli = PictureLossIndication {
+            sender_ssrc: 0,
+            media_ssrc: sender_ssrc,
+        };
+
+        if let Err(e) = sender_peer_connection.write_rtcp(&[Box::new(pli)]).await {
+            error!(
+                "Failed to send {} PLI to sender {} for receiver {}: {}",
+                reason, from_participant, to_participant, e
+            );
+            false
+        } else {
+            true
+        }
+    }
+
     async fn handle_rtcp_feedback(
         rtp_sender: Arc<RTCRtpSender>,
         sender_peer_connection: Arc<RTCPeerConnection>,
@@ -697,6 +722,9 @@ impl Room {
         let mut pli_count = 0u64;
         let mut nack_count = 0u64;
         let mut retransmit_count = 0u64;
+        let mut nack_miss_count = 0u64;
+        let mut last_receiver_pli: Option<Instant> = None;
+        let mut last_loss_recovery_pli: Option<Instant> = None;
         let exit_reason: &str;
 
         loop {
@@ -711,23 +739,27 @@ impl Room {
                             for packet in rtcp_packets {
                                 if packet.as_any().downcast_ref::<PictureLossIndication>().is_some() {
                                     pli_count += 1;
-                                    debug!(
-                                        "Received PLI #{} for {} track FROM {} (forwarding to sender {})",
-                                        pli_count, track_kind, to_participant, from_participant
-                                    );
-
-                                    let pli = PictureLossIndication {
-                                        sender_ssrc: 0,
-                                        media_ssrc: sender_ssrc,
-                                    };
-
-                                    if let Err(e) = sender_peer_connection.write_rtcp(&[Box::new(pli)]).await {
-                                        error!(
-                                            "Failed to forward PLI to sender {}: {}",
-                                            from_participant, e
+                                    if pli_count == 1 || pli_count % 50 == 0 {
+                                        info!(
+                                            "Received PLI #{} for {} track FROM {} (forwarding to sender {})",
+                                            pli_count, track_kind, to_participant, from_participant
                                         );
-                                    } else {
-                                        debug!("Forwarded PLI to sender {} for {} track", from_participant, track_kind);
+                                    }
+
+                                    let should_forward_pli = last_receiver_pli
+                                        .map(|last_sent| last_sent.elapsed() >= LOSS_RECOVERY_PLI_INTERVAL)
+                                        .unwrap_or(true);
+
+                                    if should_forward_pli
+                                        && Self::send_pli_to_sender(
+                                            &sender_peer_connection,
+                                            sender_ssrc,
+                                            &from_participant,
+                                            &to_participant,
+                                            "receiver-requested",
+                                        ).await
+                                    {
+                                        last_receiver_pli = Some(Instant::now());
                                     }
                                 }
                                 else if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
@@ -746,13 +778,15 @@ impl Room {
                                         }
                                     }
 
-                                    debug!(
-                                        "Received NACK #{} for {} packets ({:?}) FROM {} - retransmitting",
-                                        nack_count,
-                                        requested_seqs.len(),
-                                        &requested_seqs[..requested_seqs.len().min(5)],
-                                        to_participant
-                                    );
+                                    if nack_count == 1 || nack_count % 50 == 0 {
+                                        info!(
+                                            "Received NACK #{} for {} packets ({:?}) FROM {} - retransmitting",
+                                            nack_count,
+                                            requested_seqs.len(),
+                                            &requested_seqs[..requested_seqs.len().min(5)],
+                                            to_participant
+                                        );
+                                    }
 
                                     for seq in requested_seqs {
                                         if let Some(packet) = packet_buffer.get(seq).await {
@@ -764,7 +798,35 @@ impl Room {
                                                 }
                                             }
                                         } else {
-                                            debug!("Packet {} not in buffer for retransmission", seq);
+                                            nack_miss_count += 1;
+                                            if nack_miss_count == 1 || nack_miss_count % 50 == 0 {
+                                                warn!(
+                                                    "NACK miss #{} for packet {} on {} track {} → {}",
+                                                    nack_miss_count, seq, track_kind, from_participant, to_participant
+                                                );
+                                            }
+
+                                            if track_kind == webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video {
+                                                let should_send_pli = last_loss_recovery_pli
+                                                    .map(|last_sent| last_sent.elapsed() >= LOSS_RECOVERY_PLI_INTERVAL)
+                                                    .unwrap_or(true);
+
+                                                if should_send_pli
+                                                    && Self::send_pli_to_sender(
+                                                        &sender_peer_connection,
+                                                        sender_ssrc,
+                                                        &from_participant,
+                                                        &to_participant,
+                                                        "nack-miss",
+                                                    ).await
+                                                {
+                                                    last_loss_recovery_pli = Some(Instant::now());
+                                                    info!(
+                                                        "Requested video keyframe after unrecoverable packet loss {} → {}",
+                                                        from_participant, to_participant
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                 }
