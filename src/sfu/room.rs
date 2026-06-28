@@ -211,6 +211,30 @@ impl Room {
         self.participants.len()
     }
 
+    async fn track_is_negotiated_or_pending(
+        negotiated_tracks: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        pending_negotiated_tracks: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        participant_id: &str,
+        track_id: &str,
+    ) -> bool {
+        {
+            let negotiated = negotiated_tracks.read().await;
+            if negotiated
+                .get(participant_id)
+                .map(|tracks| tracks.contains(track_id))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+
+        let pending = pending_negotiated_tracks.read().await;
+        pending
+            .get(participant_id)
+            .map(|tracks| tracks.contains(track_id))
+            .unwrap_or(false)
+    }
+
     /// Check if room is empty
     pub fn is_empty(&self) -> bool {
         self.participants.is_empty()
@@ -388,10 +412,26 @@ impl Room {
                                 let participant_id_for_renego = participant_id.clone();
                                 let track_id = track.id().to_string();
                                 let pending_negotiated_tracks = Arc::clone(&self.pending_negotiated_tracks);
+                                let negotiated_tracks = Arc::clone(&self.negotiated_tracks);
 
                                 tokio::spawn(async move {
                                     let mut offer_result = None;
                                     for attempt in 1..=5 {
+                                        if Self::track_is_negotiated_or_pending(
+                                            &negotiated_tracks,
+                                            &pending_negotiated_tracks,
+                                            &participant_id_for_renego,
+                                            &track_id,
+                                        )
+                                        .await
+                                        {
+                                            info!(
+                                                "Skipping stale renegotiation retry for {} track {} to {}; already pending or negotiated",
+                                                track_kind, track_id, participant_id_for_renego
+                                            );
+                                            return;
+                                        }
+
                                         let peer_conn_lock = peer_conn_for_renego.lock().await;
                                         let result = peer_conn_lock.create_offer_if_stable().await;
                                         drop(peer_conn_lock);

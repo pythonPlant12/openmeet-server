@@ -964,6 +964,9 @@ async fn handle_message(
                                     let room_lock_for_retry = Arc::clone(&room_lock);
 
                                     tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(100))
+                                            .await;
+
                                         let room = room_lock_for_retry.read().await;
                                         let peer_conn_lock = peer_conn_for_retry.lock().await;
 
@@ -993,6 +996,13 @@ async fn handle_message(
                                             .unwrap_or_default();
                                         drop(negotiated);
 
+                                        let pending = room.pending_negotiated_tracks.read().await;
+                                        let already_pending = pending
+                                            .get(&participant_id_for_retry)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        drop(pending);
+
                                         // Check for tracks not yet negotiated (uses track_id, not stream_id)
                                         let all_track_ids: Vec<String> = room
                                             .participant_tracks
@@ -1006,6 +1016,7 @@ async fn handle_message(
                                             .iter()
                                             .filter(|track_id| {
                                                 !already_negotiated.contains(*track_id)
+                                                    && !already_pending.contains(*track_id)
                                             })
                                             .cloned()
                                             .collect();

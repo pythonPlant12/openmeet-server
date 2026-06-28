@@ -56,13 +56,8 @@ impl PeerConnectionConfig {
 
     /// Add a TURN server for NAT traversal (required for users behind symmetric NAT)
     pub fn with_turn_server(mut self, url: String, username: String, credential: String) -> Self {
-        let mut urls = vec![url.clone()];
-        if let Some(tcp_url) = turn_tcp_variant(&url) {
-            urls.push(tcp_url);
-        }
-
         self.ice_servers.push(RTCIceServer {
-            urls,
+            urls: vec![url],
             username,
             credential,
             ..Default::default()
@@ -86,14 +81,6 @@ impl PeerConnectionConfig {
         });
         self
     }
-}
-
-fn turn_tcp_variant(url: &str) -> Option<String> {
-    if !url.starts_with("turn:") || url.contains('?') {
-        return None;
-    }
-
-    Some(format!("{}?transport=tcp", url))
 }
 
 /// Wrapper around RTCPeerConnection with SFU-specific logic
@@ -348,32 +335,6 @@ impl SfuPeerConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn turn_tcp_variant_adds_tcp_transport_to_plain_turn_url() {
-        assert_eq!(
-            turn_tcp_variant("turn:turn.openmeets.eu:3478"),
-            Some("turn:turn.openmeets.eu:3478?transport=tcp".to_string())
-        );
-    }
-
-    #[test]
-    fn turn_tcp_variant_skips_urls_with_explicit_transport() {
-        assert_eq!(
-            turn_tcp_variant("turn:turn.openmeets.eu:3478?transport=udp"),
-            None
-        );
-
-        assert_eq!(
-            turn_tcp_variant("turn:turn.openmeets.eu:3478?foo=bar"),
-            None
-        );
-    }
-
-    #[test]
-    fn turn_tcp_variant_skips_turns_urls_until_tls_is_configured() {
-        assert_eq!(turn_tcp_variant("turns:turn.openmeets.eu:5349"), None);
-    }
 
     #[tokio::test]
     async fn test_create_peer_connection() {
