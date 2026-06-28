@@ -63,6 +63,9 @@ pub struct Room {
     /// Track IDs that have been successfully negotiated to each participant.
     /// Uses track_id (not stream_id) because audio+video share same stream_id.
     pub negotiated_tracks: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Track IDs included in an outstanding server offer to each participant.
+    /// They become negotiated only after the participant answers that offer.
+    pub pending_negotiated_tracks: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 impl Room {
@@ -73,6 +76,7 @@ impl Room {
             participants: HashMap::new(),
             participant_tracks: HashMap::new(),
             negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
+            pending_negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -136,12 +140,27 @@ impl Room {
             }
 
             // Remove their tracks (drops broadcast::Sender, causing receivers to stop)
+            let removed_track_ids = self
+                .participant_tracks
+                .get(participant_id)
+                .map(|tracks| tracks.iter().map(|track| track.track.id().to_string()).collect::<Vec<_>>())
+                .unwrap_or_default();
             self.remove_participant_tracks(participant_id);
 
             // Clear negotiated tracks for this participant
             {
                 let mut negotiated = self.negotiated_tracks.write().await;
                 negotiated.remove(participant_id);
+                for tracks in negotiated.values_mut() {
+                    tracks.retain(|track_id| !removed_track_ids.contains(track_id));
+                }
+            }
+            {
+                let mut pending = self.pending_negotiated_tracks.write().await;
+                pending.remove(participant_id);
+                for tracks in pending.values_mut() {
+                    tracks.retain(|track_id| !removed_track_ids.contains(track_id));
+                }
             }
 
             // Notify all remaining participants
@@ -339,27 +358,51 @@ impl Room {
                                 let participant_conn_sender = participant_conn.sender.clone();
                                 let participant_id_for_renego = participant_id.clone();
                                 let track_id = track.id().to_string();
-                                let negotiated_tracks = Arc::clone(&self.negotiated_tracks);
+                                let pending_negotiated_tracks = Arc::clone(&self.pending_negotiated_tracks);
 
                                 tokio::spawn(async move {
-                                    let peer_conn_lock = peer_conn_for_renego.lock().await;
-                                    match peer_conn_lock.create_offer_if_stable().await {
-                                        Ok(Some(offer)) => {
-                                            let _ = participant_conn_sender.send(SignalingMessage::Offer {
+                                    let mut offer_result = None;
+                                    for attempt in 1..=5 {
+                                        let peer_conn_lock = peer_conn_for_renego.lock().await;
+                                        let result = peer_conn_lock.create_offer_if_stable().await;
+                                        drop(peer_conn_lock);
+
+                                        match result {
+                                            Ok(Some(offer)) => {
+                                                offer_result = Some(Ok(offer));
+                                                break;
+                                            }
+                                            Ok(None) => {
+                                                info!("Collision for {} track to {} - retry attempt {}", track_kind, participant_id_for_renego, attempt);
+                                                tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+                                            }
+                                            Err(e) => {
+                                                offer_result = Some(Err(e));
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    match offer_result {
+                                        Some(Ok(offer)) => {
+                                            if let Err(e) = participant_conn_sender.send(SignalingMessage::Offer {
                                                 target_id: participant_id_for_renego.clone(),
                                                 sdp: offer.sdp,
-                                            });
-                                            let mut negotiated = negotiated_tracks.write().await;
-                                            negotiated
+                                            }) {
+                                                warn!("Failed to queue renegotiation offer to {}: {}", participant_id_for_renego, e);
+                                                return;
+                                            }
+                                            let mut pending = pending_negotiated_tracks.write().await;
+                                            pending
                                                 .entry(participant_id_for_renego.clone())
                                                 .or_insert_with(HashSet::new)
                                                 .insert(track_id.clone());
-                                            info!("Negotiated {} track {} to {}", track_kind, track_id, participant_id_for_renego);
+                                            info!("Sent renegotiation offer for {} track {} to {}", track_kind, track_id, participant_id_for_renego);
                                         }
-                                        Ok(None) => {
-                                            info!("Collision for {} track to {} - pending retry", track_kind, participant_id_for_renego);
+                                        None => {
+                                            warn!("Failed to send renegotiation offer for {} track {} to {} after collision retries", track_kind, track_id, participant_id_for_renego);
                                         }
-                                        Err(e) => {
+                                        Some(Err(e)) => {
                                             error!("Renegotiation failed for {}: {}", participant_id_for_renego, e);
                                         }
                                     }

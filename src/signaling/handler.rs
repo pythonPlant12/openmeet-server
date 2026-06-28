@@ -7,7 +7,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use metrics::{counter, gauge};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -22,6 +22,60 @@ use crate::sfu::{
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
+
+#[derive(Default)]
+struct CandidateTypeCounts {
+    host: usize,
+    srflx: usize,
+    relay: usize,
+    other: usize,
+}
+
+impl CandidateTypeCounts {
+    fn record(&mut self, candidate: &str) {
+        match ice_candidate_type(candidate) {
+            "host" => self.host += 1,
+            "srflx" => self.srflx += 1,
+            "relay" => self.relay += 1,
+            _ => self.other += 1,
+        }
+    }
+}
+
+fn ice_candidate_type(candidate: &str) -> &str {
+    let parts: Vec<&str> = candidate.split_whitespace().collect();
+    parts
+        .iter()
+        .position(|part| *part == "typ")
+        .and_then(|index| parts.get(index + 1))
+        .copied()
+        .unwrap_or("unknown")
+}
+
+fn ice_candidate_address(candidate: &str) -> Option<&str> {
+    candidate.split_whitespace().nth(4)
+}
+
+fn is_loopback_candidate(candidate: &str) -> bool {
+    ice_candidate_address(candidate)
+        .map(|address| address == "127.0.0.1" || address == "::1" || address == "localhost")
+        .unwrap_or(false)
+}
+
+fn is_docker_private_candidate(candidate: &str) -> bool {
+    ice_candidate_address(candidate)
+        .map(|address| address.starts_with("172.") || address.starts_with("10."))
+        .unwrap_or(false)
+}
+
+fn turn_url_host(url: &str) -> &str {
+    url.strip_prefix("turn:")
+        .or_else(|| url.strip_prefix("turns:"))
+        .unwrap_or(url)
+        .split([':', '?', '/'])
+        .next()
+        .unwrap_or(url)
+}
 
 /// WebSocket handler - upgrades HTTP to WebSocket
 pub async fn websocket_handler(
@@ -51,9 +105,21 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
         while let Some(message) = rx.recv().await {
             match serde_json::to_string(&message) {
                 Ok(json) => {
-                    if let Err(e) = sender.send(Message::Text(json.into())).await {
-                        error!("✗ Send failed to {}: {}", participant_id_for_logging, e);
-                        break;
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        sender.send(Message::Text(json.into())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            error!("✗ Send failed to {}: {}", participant_id_for_logging, e);
+                            break;
+                        }
+                        Err(_) => {
+                            error!("✗ Send timed out to {}", participant_id_for_logging);
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -112,26 +178,14 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
     tokio::select! {
         _ = &mut send_task => {
             recv_task.abort();
+            cleanup_participant_connection(&room_repo, None, &participant_id).await;
         }
         result = &mut recv_task => {
             send_task.abort();
 
             // Clean up: remove participant from room
             if let Ok((Some(room_id), participant_id)) = result {
-                if let Some(room_lock) = room_repo.get_room(&room_id).await {
-                    let mut room = room_lock.write().await;
-                    room.remove_participant(&participant_id).await;
-
-                    // Delete room if empty
-                    if room.is_empty() {
-                        drop(room); // Release lock before deleting
-                        let _ = room_repo.delete_room(&room_id).await;
-                        info!("Deleted empty room: {}", room_id);
-                        // Metrics: room deleted
-                        counter!("sfu_rooms_deleted_total").increment(1);
-                        gauge!("sfu_active_rooms").decrement(1.0);
-                    }
-                }
+                cleanup_participant_connection(&room_repo, Some(room_id.as_str()), &participant_id).await;
             }
         }
     }
@@ -141,6 +195,53 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
     // Metrics: track disconnection
     counter!("sfu_websocket_disconnections_total").increment(1);
     gauge!("sfu_active_connections").decrement(1.0);
+}
+
+async fn cleanup_participant_connection(
+    room_repo: &Arc<dyn RoomRepository>,
+    known_room_id: Option<&str>,
+    participant_id: &str,
+) {
+    if let Some(room_id) = known_room_id {
+        cleanup_participant_from_room(room_repo, room_id, participant_id).await;
+        return;
+    }
+
+    for room_id in room_repo.list_rooms().await {
+        let removed = cleanup_participant_from_room(room_repo, &room_id, participant_id).await;
+        if removed {
+            return;
+        }
+    }
+}
+
+async fn cleanup_participant_from_room(
+    room_repo: &Arc<dyn RoomRepository>,
+    room_id: &str,
+    participant_id: &str,
+) -> bool {
+    let Some(room_lock) = room_repo.get_room(room_id).await else {
+        return false;
+    };
+
+    let mut room = room_lock.write().await;
+    if !room.participants.contains_key(participant_id) {
+        return false;
+    }
+
+    room.remove_participant(participant_id).await;
+
+    // Delete room if empty
+    if room.is_empty() {
+        drop(room); // Release lock before deleting
+        let _ = room_repo.delete_room(room_id).await;
+        info!("Deleted empty room: {}", room_id);
+        // Metrics: room deleted
+        counter!("sfu_rooms_deleted_total").increment(1);
+        gauge!("sfu_active_rooms").decrement(1.0);
+    }
+
+    true
 }
 
 /// Handle individual signaling messages
@@ -226,6 +327,40 @@ async fn handle_message(
                         config = config.with_stun_server(stun_url);
                     }
                 }
+
+                let turn_hosts: Vec<String> = config
+                    .ice_servers
+                    .iter()
+                    .flat_map(|server| server.urls.iter())
+                    .filter(|url| url.starts_with("turn:" ) || url.starts_with("turns:"))
+                    .map(|url| turn_url_host(url).to_string())
+                    .collect();
+
+                info!(
+                    "ICE config for {}: public_ip={}, udp_range={}, turn_hosts={:?}",
+                    participant_id,
+                    config.public_ip.as_deref().unwrap_or("<none>"),
+                    config
+                        .udp_port_range
+                        .map(|(min, max)| format!("{}-{}", min, max))
+                        .unwrap_or_else(|| "<ephemeral>".to_string()),
+                    turn_hosts
+                );
+
+                if config.public_ip.is_none() {
+                    warn!(
+                        "PUBLIC_IP is not configured for {}. Remote browsers may receive Docker/private ICE candidates and fail to connect media.",
+                        participant_id
+                    );
+                }
+
+                if turn_hosts.iter().any(|host| host == "localhost" || host == "127.0.0.1") {
+                    warn!(
+                        "TURN host for {} resolves to loopback. This only works for same-machine browser tests.",
+                        participant_id
+                    );
+                }
+
                 match SfuPeerConnection::new(participant_id.to_string(), config).await {
                     Ok(peer_conn) => {
                         // Metrics: peer connection created successfully
@@ -236,14 +371,34 @@ async fn handle_message(
                             let raw_pc = pc.get_peer_connection();
                             let tx_ice = tx.clone();
                             let participant_id_ice = participant_id.to_string();
+                            let room_id_ice = room_id.clone();
+                            let candidate_counts = Arc::new(StdMutex::new(CandidateTypeCounts::default()));
+                            let candidate_counts_for_handler = Arc::clone(&candidate_counts);
 
                             raw_pc.on_ice_candidate(Box::new(move |candidate| {
                                 let tx = tx_ice.clone();
                                 let participant_id = participant_id_ice.clone();
+                                let candidate_counts = Arc::clone(&candidate_counts_for_handler);
                                 Box::pin(async move {
                                     if let Some(candidate) = candidate {
                                         match candidate.to_json() {
                                             Ok(init) => {
+                                                if let Ok(mut counts) = candidate_counts.lock() {
+                                                    counts.record(&init.candidate);
+                                                }
+
+                                                if is_loopback_candidate(&init.candidate) {
+                                                    warn!(
+                                                        "SFU generated loopback ICE candidate for {}: {}. Remote browsers cannot use this candidate.",
+                                                        participant_id, init.candidate
+                                                    );
+                                                } else if is_docker_private_candidate(&init.candidate) {
+                                                    warn!(
+                                                        "SFU generated private/container ICE candidate for {}: {}. Ensure PUBLIC_IP/NAT mapping is configured for remote browsers.",
+                                                        participant_id, init.candidate
+                                                    );
+                                                }
+
                                                 info!(
                                                     "SFU generated ICE candidate for {}: {}",
                                                     participant_id, init.candidate
@@ -260,10 +415,44 @@ async fn handle_message(
                                             }
                                         }
                                     } else {
-                                        info!("ICE gathering complete for {}", participant_id);
+                                        if let Ok(counts) = candidate_counts.lock() {
+                                            info!(
+                                                "ICE gathering complete for {}: host={}, srflx={}, relay={}, other={}",
+                                                participant_id,
+                                                counts.host,
+                                                counts.srflx,
+                                                counts.relay,
+                                                counts.other
+                                            );
+                                        } else {
+                                            info!("ICE gathering complete for {}", participant_id);
+                                        }
                                     }
                                 })
                             }));
+
+                            let raw_pc_for_check = Arc::clone(&raw_pc);
+                            let participant_id_for_check = participant_id.to_string();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                                let ice_state = raw_pc_for_check.ice_connection_state();
+                                let peer_state = raw_pc_for_check.connection_state();
+
+                                if !matches!(
+                                    ice_state,
+                                    webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Connected
+                                        | webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Completed
+                                        | webrtc::ice_transport::ice_connection_state::RTCIceConnectionState::Closed
+                                ) {
+                                    warn!(
+                                        "Participant {} in room {} negotiated but ICE is still {:?} after 8s (peer={:?}). Check PUBLIC_IP, TURN external-ip, and firewall/UDP reachability.",
+                                        participant_id_for_check,
+                                        room_id_ice,
+                                        ice_state,
+                                        peer_state
+                                    );
+                                }
+                            });
                         }
 
                         // Set up track handler to forward media to other participants
@@ -396,7 +585,7 @@ async fn handle_message(
                                                 let peer_conn_for_renego = Arc::clone(&peer_conn);
                                                 let tx_for_renego = tx.clone();
                                                 let participant_id_for_renego = participant_id.to_string();
-                                                let negotiated_tracks_ref = Arc::clone(&room.negotiated_tracks);
+                                                let pending_negotiated_tracks_ref = Arc::clone(&room.pending_negotiated_tracks);
 
                                                 // Get the late joiner's shutdown receiver - used to stop writer tasks when they disconnect
                                                 let shutdown_rx_for_late_joiner = participant_conn.get_shutdown_receiver();
@@ -470,19 +659,49 @@ async fn handle_message(
                                                         }
                                                     }
 
-                                                    // Send renegotiation offer and mark tracks as negotiated only on success
-                                                    match peer_conn_lock.create_offer_if_stable().await {
-                                                        Ok(Some(offer)) => {
+                                                    drop(peer_conn_lock);
+
+                                                    // Send renegotiation offer and mark tracks as pending only on success.
+                                                    // A non-stable signaling state is glare/collision; retry briefly because otherwise
+                                                    // the added tracks can remain on the PeerConnection without a matching offer.
+                                                    let mut offer_result = None;
+                                                    for attempt in 1..=5 {
+                                                        let peer_conn_lock = peer_conn_for_renego.lock().await;
+                                                        let result = peer_conn_lock.create_offer_if_stable().await;
+                                                        drop(peer_conn_lock);
+
+                                                        match result {
+                                                            Ok(Some(offer)) => {
+                                                                offer_result = Some(Ok(offer));
+                                                                break;
+                                                            }
+                                                            Ok(None) => {
+                                                                info!("Skipping renegotiation for {} - collision, retry attempt {}", participant_id_for_renego, attempt);
+                                                                tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+                                                            }
+                                                            Err(e) => {
+                                                                offer_result = Some(Err(e));
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+
+                                                    match offer_result {
+                                                        Some(Ok(offer)) => {
                                                             info!("Sending renegotiation offer to {} with {} tracks", participant_id_for_renego, pending_forwards.len());
-                                                            let _ = tx_for_renego.send(SignalingMessage::Offer {
+                                                            if let Err(e) = tx_for_renego.send(SignalingMessage::Offer {
                                                                 target_id: participant_id_for_renego.clone(),
                                                                 sdp: offer.sdp,
-                                                            });
+                                                            }) {
+                                                                warn!("Failed to queue renegotiation offer to {}: {}", participant_id_for_renego, e);
+                                                                return;
+                                                            }
 
-                                                            // Mark tracks as negotiated and start RTP forwarding via broadcast subscription
-                                                            let mut negotiated = negotiated_tracks_ref.write().await;
+                                                            // Mark tracks as pending and start RTP forwarding via broadcast subscription.
+                                                            // They become negotiated only after the client answers this server offer.
+                                                            let mut pending = pending_negotiated_tracks_ref.write().await;
                                                             for (track_remote, local_track, rtp_sender, from_id, track_id, sender_pc, sender_ssrc, packet_broadcaster) in pending_forwards {
-                                                                negotiated
+                                                                pending
                                                                     .entry(participant_id_for_renego.clone())
                                                                     .or_insert_with(std::collections::HashSet::new)
                                                                     .insert(track_id.clone());
@@ -528,10 +747,10 @@ async fn handle_message(
                                                                 }
                                                             }
                                                         }
-                                                        Ok(None) => {
-                                                            info!("Skipping renegotiation for {} - collision, will retry", participant_id_for_renego);
+                                                        None => {
+                                                            warn!("Failed to send renegotiation offer to {} after collision retries", participant_id_for_renego);
                                                         }
-                                                        Err(e) => {
+                                                        Some(Err(e)) => {
                                                             error!("Failed to create renegotiation offer for {}: {}", participant_id_for_renego, e);
                                                         }
                                                     }
@@ -586,7 +805,21 @@ async fn handle_message(
                                         let room = room_lock_for_retry.read().await;
                                         let peer_conn_lock = peer_conn_for_retry.lock().await;
 
-                                        // Get track IDs already negotiated to this participant
+                                        // Promote tracks from the answered server offer into the negotiated set.
+                                        let pending_track_ids = {
+                                            let mut pending = room.pending_negotiated_tracks.write().await;
+                                            pending.remove(&participant_id_for_retry).unwrap_or_default()
+                                        };
+
+                                        if !pending_track_ids.is_empty() {
+                                            let mut negotiated = room.negotiated_tracks.write().await;
+                                            negotiated
+                                                .entry(participant_id_for_retry.clone())
+                                                .or_insert_with(std::collections::HashSet::new)
+                                                .extend(pending_track_ids);
+                                        }
+
+                                        // Get track IDs already negotiated to this participant.
                                         let negotiated = room.negotiated_tracks.read().await;
                                         let already_negotiated = negotiated
                                             .get(&participant_id_for_retry)
@@ -617,15 +850,18 @@ async fn handle_message(
                                             match peer_conn_lock.create_offer_if_stable().await {
                                                 Ok(Some(offer)) => {
                                                     info!("✓ Retry offer sent for {}", participant_id_for_retry);
-                                                    let _ = tx_for_retry.send(SignalingMessage::Offer {
+                                                    if let Err(e) = tx_for_retry.send(SignalingMessage::Offer {
                                                         target_id: participant_id_for_retry.clone(),
                                                         sdp: offer.sdp,
-                                                    });
+                                                    }) {
+                                                        warn!("Failed to queue retry offer to {}: {}", participant_id_for_retry, e);
+                                                        return;
+                                                    }
 
-                                                    // Mark these tracks as negotiated now
-                                                    let mut negotiated = room.negotiated_tracks.write().await;
+                                                    // Mark these tracks pending until the client answers this retry offer.
+                                                    let mut pending = room.pending_negotiated_tracks.write().await;
                                                     for track_id in missing_track_ids {
-                                                        negotiated
+                                                        pending
                                                             .entry(participant_id_for_retry.clone())
                                                             .or_insert_with(std::collections::HashSet::new)
                                                             .insert(track_id);
