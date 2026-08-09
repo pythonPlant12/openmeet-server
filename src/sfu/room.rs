@@ -68,6 +68,9 @@ pub struct Room {
     /// Track IDs included in an outstanding server offer to each participant.
     /// They become negotiated only after the participant answers that offer.
     pub pending_negotiated_tracks: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Track IDs that have an RTP forwarding subscription to each participant.
+    /// This is separate from negotiation state so retries cannot add duplicate writers.
+    pub forwarded_tracks: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 impl Room {
@@ -79,6 +82,7 @@ impl Room {
             participant_tracks: HashMap::new(),
             negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
             pending_negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
+            forwarded_tracks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -182,6 +186,13 @@ impl Room {
                     tracks.retain(|track_id| !removed_track_ids.contains(track_id));
                 }
             }
+            {
+                let mut forwarded = self.forwarded_tracks.write().await;
+                forwarded.remove(participant_id);
+                for tracks in forwarded.values_mut() {
+                    tracks.retain(|track_id| !removed_track_ids.contains(track_id));
+                }
+            }
 
             // Notify all remaining participants
             self.broadcast(SignalingMessage::ParticipantLeft {
@@ -233,6 +244,38 @@ impl Room {
             .get(participant_id)
             .map(|tracks| tracks.contains(track_id))
             .unwrap_or(false)
+    }
+
+    pub async fn reserve_forwarded_track(
+        forwarded_tracks: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        participant_id: &str,
+        track_id: &str,
+    ) -> bool {
+        let mut forwarded = forwarded_tracks.write().await;
+        let tracks = forwarded
+            .entry(participant_id.to_string())
+            .or_insert_with(HashSet::new);
+
+        if tracks.contains(track_id) {
+            return false;
+        }
+
+        tracks.insert(track_id.to_string());
+        true
+    }
+
+    pub async fn release_forwarded_track(
+        forwarded_tracks: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+        participant_id: &str,
+        track_id: &str,
+    ) {
+        let mut forwarded = forwarded_tracks.write().await;
+        if let Some(tracks) = forwarded.get_mut(participant_id) {
+            tracks.remove(track_id);
+            if tracks.is_empty() {
+                forwarded.remove(participant_id);
+            }
+        }
     }
 
     /// Check if room is empty
@@ -341,6 +384,7 @@ impl Room {
         let track_kind = track.kind();
         let stream_id = track.stream_id();
         let sender_ssrc = track.ssrc();
+        let original_track_id = track.id().to_string();
 
         // Get sender info for StreamOwner message
         let sender_name = self
@@ -375,6 +419,20 @@ impl Room {
             });
 
             if let Some(peer_conn) = participant_conn.get_peer_connection() {
+                if !Self::reserve_forwarded_track(
+                    &self.forwarded_tracks,
+                    participant_id,
+                    &original_track_id,
+                )
+                .await
+                {
+                    info!(
+                        "Skipping duplicate forwarding subscription for {} track {} {} → {}",
+                        track_kind, original_track_id, sender_id, participant_id
+                    );
+                    continue;
+                }
+
                 let peer_conn_lock = peer_conn.lock().await;
                 let pc = peer_conn_lock.get_peer_connection();
 
@@ -390,6 +448,16 @@ impl Room {
                                         continue;
                                     }
                                 };
+
+                                info!(
+                                    "Created forwarding subscription: {} track={} ssrc={} local_ssrc={} {} → {}",
+                                    track_kind,
+                                    original_track_id,
+                                    sender_ssrc,
+                                    local_ssrc,
+                                    sender_id,
+                                    participant_id
+                                );
 
                                 receivers.push((participant_id.clone(), local_track, rtp_sender, local_ssrc, shutdown_rx.clone()));
 
@@ -478,11 +546,23 @@ impl Room {
                                 });
                             }
                             Err(e) => {
+                                Self::release_forwarded_track(
+                                    &self.forwarded_tracks,
+                                    participant_id,
+                                    &original_track_id,
+                                )
+                                .await;
                                 error!("Failed to add track to {}: {}", participant_id, e);
                             }
                         }
                     }
                     Err(e) => {
+                        Self::release_forwarded_track(
+                            &self.forwarded_tracks,
+                            participant_id,
+                            &original_track_id,
+                        )
+                        .await;
                         error!("Failed to create forwarding track: {}", e);
                     }
                 }

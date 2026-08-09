@@ -627,6 +627,8 @@ async fn handle_message(
                                                     participant_id.to_string();
                                                 let pending_negotiated_tracks_ref =
                                                     Arc::clone(&room.pending_negotiated_tracks);
+                                                let forwarded_tracks_ref =
+                                                    Arc::clone(&room.forwarded_tracks);
 
                                                 // Get the late joiner's shutdown receiver - used to stop writer tasks when they disconnect
                                                 let shutdown_rx_for_late_joiner =
@@ -707,6 +709,26 @@ async fn handle_message(
                                                             packet_broadcaster,
                                                         ) in track_tuples
                                                         {
+                                                            let original_track_id =
+                                                                track.id().to_string();
+
+                                                            if !Room::reserve_forwarded_track(
+                                                                &forwarded_tracks_ref,
+                                                                &participant_id_for_renego,
+                                                                &original_track_id,
+                                                            )
+                                                            .await
+                                                            {
+                                                                info!(
+                                                                    "Skipping duplicate existing {} track {} from {} to {}",
+                                                                    track.kind(),
+                                                                    original_track_id,
+                                                                    sender_id,
+                                                                    participant_id_for_renego
+                                                                );
+                                                                continue;
+                                                            }
+
                                                             match Room::create_forwarding_track(
                                                                 &track,
                                                             )
@@ -725,11 +747,21 @@ async fn handle_message(
                                                                         .await
                                                                     {
                                                                         Ok(rtp_sender) => {
+                                                                            let local_ssrc = rtp_sender
+                                                                                .get_parameters()
+                                                                                .await
+                                                                                .encodings
+                                                                                .first()
+                                                                                .map(|encoding| encoding.ssrc)
+                                                                                .unwrap_or(0);
                                                                             info!(
-                                                                                "Added existing {} track from {} to {}",
+                                                                                "Added existing {} track {} from {} to {} (sender_ssrc={}, local_ssrc={})",
                                                                                 track.kind(),
+                                                                                original_track_id,
                                                                                 sender_id,
-                                                                                participant_id_for_renego
+                                                                                participant_id_for_renego,
+                                                                                sender_ssrc,
+                                                                                local_ssrc
                                                                             );
                                                                             pending_forwards
                                                                                 .push((
@@ -749,6 +781,12 @@ async fn handle_message(
                                                                             ));
                                                                         }
                                                                         Err(e) => {
+                                                                            Room::release_forwarded_track(
+                                                                                &forwarded_tracks_ref,
+                                                                                &participant_id_for_renego,
+                                                                                &original_track_id,
+                                                                            )
+                                                                            .await;
                                                                             error!(
                                                                                 "Failed to add track: {}",
                                                                                 e
@@ -757,6 +795,12 @@ async fn handle_message(
                                                                     }
                                                                 }
                                                                 Err(e) => {
+                                                                    Room::release_forwarded_track(
+                                                                        &forwarded_tracks_ref,
+                                                                        &participant_id_for_renego,
+                                                                        &original_track_id,
+                                                                    )
+                                                                    .await;
                                                                     error!(
                                                                         "Failed to create forwarding track: {}",
                                                                         e
@@ -1003,6 +1047,13 @@ async fn handle_message(
                                             .unwrap_or_default();
                                         drop(pending);
 
+                                        let forwarded = room.forwarded_tracks.read().await;
+                                        let already_forwarded = forwarded
+                                            .get(&participant_id_for_retry)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        drop(forwarded);
+
                                         // Check for tracks not yet negotiated (uses track_id, not stream_id)
                                         let all_track_ids: Vec<String> = room
                                             .participant_tracks
@@ -1017,9 +1068,30 @@ async fn handle_message(
                                             .filter(|track_id| {
                                                 !already_negotiated.contains(*track_id)
                                                     && !already_pending.contains(*track_id)
+                                                    && already_forwarded.contains(*track_id)
                                             })
                                             .cloned()
                                             .collect();
+
+                                        let unforwarded_missing_track_ids: Vec<String> =
+                                            all_track_ids
+                                                .iter()
+                                                .filter(|track_id| {
+                                                    !already_negotiated.contains(*track_id)
+                                                        && !already_pending.contains(*track_id)
+                                                        && !already_forwarded.contains(*track_id)
+                                                })
+                                                .cloned()
+                                                .collect();
+
+                                        if !unforwarded_missing_track_ids.is_empty() {
+                                            warn!(
+                                                "Not retrying {} unforwarded tracks for {}: {:?}",
+                                                unforwarded_missing_track_ids.len(),
+                                                participant_id_for_retry,
+                                                unforwarded_missing_track_ids
+                                            );
+                                        }
 
                                         if !missing_track_ids.is_empty() {
                                             info!(
