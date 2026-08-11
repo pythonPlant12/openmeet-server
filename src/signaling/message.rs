@@ -1,9 +1,32 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessagePayload {
+    pub participant_id: String,
+    pub participant_name: String,
+    pub message: String,
+    pub timestamp: u64,
+}
+
 /// Messages sent between client and server for WebRTC signaling
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SignalingMessage {
+    /// First client message. Credentials are sent in-frame, never in the URL.
+    #[serde(rename_all = "camelCase")]
+    Authenticate {
+        protocol_version: u16,
+        access_token: Option<String>,
+    },
+
+    /// Server confirms session identity decision before room operations.
+    #[serde(rename_all = "camelCase")]
+    Authenticated {
+        protocol_version: u16,
+        authenticated: bool,
+    },
+
     /// Client wants to join a room
     #[serde(rename_all = "camelCase")]
     Join {
@@ -71,6 +94,10 @@ pub enum SignalingMessage {
         timestamp: u64,
     },
 
+    /// Existing messages sent to a participant when they join
+    #[serde(rename_all = "camelCase")]
+    ChatHistory { messages: Vec<ChatMessagePayload> },
+
     /// Error message from server
     Error { message: String },
 }
@@ -93,6 +120,19 @@ mod tests {
     }
 
     #[test]
+    fn test_authenticate_message_uses_camel_case() {
+        let msg = SignalingMessage::Authenticate {
+            protocol_version: 2,
+            access_token: None,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&msg).unwrap(),
+            r#"{"type":"authenticate","protocolVersion":2,"accessToken":null}"#
+        );
+    }
+
+    #[test]
     fn test_deserialize_offer_message() {
         let json = r#"{"type":"offer","targetId":"peer123","sdp":"v=0..."}"#;
         let msg: SignalingMessage = serde_json::from_str(json).unwrap();
@@ -104,5 +144,23 @@ mod tests {
             }
             _ => panic!("Wrong message type"),
         }
+    }
+
+    #[test]
+    fn test_serialize_chat_history() {
+        let msg = SignalingMessage::ChatHistory {
+            messages: vec![ChatMessagePayload {
+                participant_id: "peer123".to_string(),
+                participant_name: "Alice".to_string(),
+                message: "Welcome".to_string(),
+                timestamp: 1234,
+            }],
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"chatHistory","messages":[{"participantId":"peer123","participantName":"Alice","message":"Welcome","timestamp":1234}]}"#
+        );
     }
 }

@@ -236,7 +236,7 @@ async fn create_tokens(
 }
 
 // Helper: extract user ID from Authorization header
-fn extract_user_id(
+pub(crate) fn extract_user_id(
     jwt: &JwtConfig,
     headers: &header::HeaderMap,
 ) -> Result<uuid::Uuid, (StatusCode, String)> {

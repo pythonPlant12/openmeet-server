@@ -1,8 +1,7 @@
 use crate::sfu::packet_buffer::RtpPacketBuffer;
 use crate::sfu::participant::ParticipantConnection;
-use crate::signaling::message::SignalingMessage;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use crate::signaling::message::{ChatMessagePayload, SignalingMessage};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use sysinfo::{Pid, System};
 use tokio::sync::RwLock;
@@ -21,6 +20,9 @@ use webrtc::track::track_remote::TrackRemote;
 
 /// Broadcast channel capacity for RTP packets
 const RTP_BROADCAST_CAPACITY: usize = 256;
+const CHAT_HISTORY_CAPACITY: usize = 500;
+const ROOM_CHAT_RATE_LIMIT: usize = 50;
+const ROOM_CHAT_RATE_WINDOW: Duration = Duration::from_secs(5);
 const LOSS_RECOVERY_PLI_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Log current process memory usage
@@ -71,6 +73,8 @@ pub struct Room {
     /// Track IDs that have an RTP forwarding subscription to each participant.
     /// This is separate from negotiation state so retries cannot add duplicate writers.
     pub forwarded_tracks: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    chat_history: VecDeque<ChatMessagePayload>,
+    recent_chat_messages: VecDeque<Instant>,
 }
 
 impl Room {
@@ -83,6 +87,8 @@ impl Room {
             negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
             pending_negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
             forwarded_tracks: Arc::new(RwLock::new(HashMap::new())),
+            chat_history: VecDeque::with_capacity(CHAT_HISTORY_CAPACITY),
+            recent_chat_messages: VecDeque::with_capacity(ROOM_CHAT_RATE_LIMIT),
         }
     }
 
@@ -281,6 +287,34 @@ impl Room {
     /// Check if room is empty
     pub fn is_empty(&self) -> bool {
         self.participants.is_empty()
+    }
+
+    /// Keep recent chat attached to the active room for participants who join later.
+    pub fn allow_chat_message(&mut self) -> bool {
+        let now = Instant::now();
+        while self
+            .recent_chat_messages
+            .front()
+            .is_some_and(|sent_at| now.duration_since(*sent_at) >= ROOM_CHAT_RATE_WINDOW)
+        {
+            self.recent_chat_messages.pop_front();
+        }
+        if self.recent_chat_messages.len() >= ROOM_CHAT_RATE_LIMIT {
+            return false;
+        }
+        self.recent_chat_messages.push_back(now);
+        true
+    }
+
+    pub fn record_chat_message(&mut self, message: ChatMessagePayload) {
+        if self.chat_history.len() == CHAT_HISTORY_CAPACITY {
+            self.chat_history.pop_front();
+        }
+        self.chat_history.push_back(message);
+    }
+
+    pub fn chat_history(&self) -> Vec<ChatMessagePayload> {
+        self.chat_history.iter().cloned().collect()
     }
 
     /// Broadcast a message to all participants in the room
@@ -1032,5 +1066,42 @@ impl Room {
                 self.id, track_count, participant_id
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_history_keeps_latest_messages_in_order() {
+        let mut room = Room::new("room-1".to_string());
+
+        for timestamp in 0..=CHAT_HISTORY_CAPACITY as u64 {
+            room.record_chat_message(ChatMessagePayload {
+                participant_id: "peer-1".to_string(),
+                participant_name: "Alice".to_string(),
+                message: format!("Message {timestamp}"),
+                timestamp,
+            });
+        }
+
+        let history = room.chat_history();
+        assert_eq!(history.len(), CHAT_HISTORY_CAPACITY);
+        assert_eq!(history.first().unwrap().timestamp, 1);
+        assert_eq!(
+            history.last().unwrap().timestamp,
+            CHAT_HISTORY_CAPACITY as u64
+        );
+    }
+
+    #[test]
+    fn chat_rate_limit_applies_across_room_participants() {
+        let mut room = Room::new("room-1".to_string());
+
+        for _ in 0..ROOM_CHAT_RATE_LIMIT {
+            assert!(room.allow_chat_message());
+        }
+        assert!(!room.allow_chat_message());
     }
 }

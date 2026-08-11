@@ -3,6 +3,7 @@ use crate::signaling::message::SignalingMessage;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::info;
+use uuid::Uuid;
 
 /// Represents a participant in a video conference room
 #[derive(Debug, Clone)]
@@ -11,6 +12,7 @@ pub struct Participant {
     pub name: String,
     pub audio_enabled: bool,
     pub video_enabled: bool,
+    pub user_id: Option<Uuid>,
 }
 
 impl Participant {
@@ -20,6 +22,7 @@ impl Participant {
             name,
             audio_enabled: true,
             video_enabled: true,
+            user_id: None,
         }
     }
 

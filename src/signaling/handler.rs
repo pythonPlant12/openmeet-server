@@ -5,23 +5,44 @@ use axum::{
     },
     response::Response,
 };
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
 use futures_util::{SinkExt, StreamExt};
 use metrics::{counter, gauge};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::AppState;
+use crate::auth::models::User;
+use crate::schema::users;
 use crate::sfu::{
     participant::{Participant, ParticipantConnection},
     peer_connection::{PeerConnectionConfig, SfuPeerConnection},
     repository::RoomRepository,
     room::Room,
 };
-use crate::signaling::message::SignalingMessage;
+use crate::signaling::message::{ChatMessagePayload, SignalingMessage};
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
+
+const CHAT_RATE_LIMIT: usize = 10;
+const CHAT_RATE_WINDOW: Duration = Duration::from_secs(5);
+const SIGNALING_PROTOCOL_VERSION: u16 = 2;
+const MAX_SIGNALING_MESSAGE_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct SessionIdentity {
+    decided: bool,
+    user_id: Option<Uuid>,
+    display_name: Option<String>,
+}
 
 #[derive(Default)]
 struct CandidateTypeCounts {
@@ -82,15 +103,15 @@ fn turn_url_host(url: &str) -> &str {
 }
 
 /// WebSocket handler - upgrades HTTP to WebSocket
-pub async fn websocket_handler(
-    ws: WebSocketUpgrade,
-    State(room_repo): State<Arc<dyn RoomRepository>>,
-) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, room_repo))
+pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    ws.max_message_size(MAX_SIGNALING_MESSAGE_BYTES)
+        .max_frame_size(MAX_SIGNALING_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 /// Handle an individual WebSocket connection
-async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let room_repo = Arc::clone(&state.room_repo);
     let (mut sender, mut receiver) = socket.split();
 
     // Channel for sending messages to this client
@@ -139,6 +160,8 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
     // Variables to track this participant's state
     let mut current_room_id: Option<String> = None;
     let mut participant_name: Option<String> = None;
+    let mut identity = SessionIdentity::default();
+    let mut recent_chat_messages = VecDeque::with_capacity(CHAT_RATE_LIMIT);
 
     // Clone for use in recv_task (Arc clone is cheap, String clone is needed)
     let room_repo_clone = Arc::clone(&room_repo);
@@ -152,6 +175,50 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
                     // Parse the JSON message
                     match serde_json::from_str::<SignalingMessage>(&text) {
                         Ok(msg) => {
+                            if let SignalingMessage::Authenticate {
+                                protocol_version,
+                                access_token,
+                            } = &msg
+                            {
+                                if identity.decided {
+                                    let _ = tx.send(SignalingMessage::Error {
+                                        message: "Session identity already decided".to_string(),
+                                    });
+                                    break;
+                                }
+
+                                match authenticate_session(
+                                    &state,
+                                    *protocol_version,
+                                    access_token.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(authenticated_identity) => {
+                                        identity = authenticated_identity;
+                                        let _ = tx.send(SignalingMessage::Authenticated {
+                                            protocol_version: SIGNALING_PROTOCOL_VERSION,
+                                            authenticated: identity.user_id.is_some(),
+                                        });
+                                    }
+                                    Err(message) => {
+                                        let _ = tx.send(SignalingMessage::Error { message });
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if !identity.decided {
+                                if state.enforce_room_access {
+                                    let _ = tx.send(SignalingMessage::Error {
+                                        message: "Authenticate before room operations".to_string(),
+                                    });
+                                    break;
+                                }
+                                identity.decided = true;
+                            }
+
                             handle_message(
                                 msg,
                                 &participant_id_clone,
@@ -159,6 +226,9 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
                                 &mut participant_name,
                                 &tx,
                                 &room_repo_clone,
+                                &mut recent_chat_messages,
+                                identity.user_id,
+                                identity.display_name.as_deref(),
                             )
                             .await;
                         }
@@ -191,11 +261,17 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
             cleanup_participant_connection(&room_repo, None, &participant_id).await;
         }
         result = &mut recv_task => {
-            send_task.abort();
-
             // Clean up: remove participant from room
             if let Ok((Some(room_id), participant_id)) = result {
                 cleanup_participant_connection(&room_repo, Some(room_id.as_str()), &participant_id).await;
+            }
+
+            // Let queued terminal errors reach the socket after the receiver exits.
+            if tokio::time::timeout(Duration::from_millis(250), &mut send_task)
+                .await
+                .is_err()
+            {
+                send_task.abort();
             }
         }
     }
@@ -205,6 +281,45 @@ async fn handle_socket(socket: WebSocket, room_repo: Arc<dyn RoomRepository>) {
     // Metrics: track disconnection
     counter!("sfu_websocket_disconnections_total").increment(1);
     gauge!("sfu_active_connections").decrement(1.0);
+}
+
+async fn authenticate_session(
+    state: &AppState,
+    protocol_version: u16,
+    access_token: Option<&str>,
+) -> Result<SessionIdentity, String> {
+    if protocol_version != SIGNALING_PROTOCOL_VERSION {
+        return Err("Unsupported signaling protocol".to_string());
+    }
+
+    let Some(access_token) = access_token else {
+        return Ok(SessionIdentity {
+            decided: true,
+            ..SessionIdentity::default()
+        });
+    };
+
+    let user_id = state
+        .jwt
+        .validate_access_token(access_token)
+        .map_err(|_| "Invalid or expired access token".to_string())?;
+    let mut conn = state
+        .pool
+        .get()
+        .await
+        .map_err(|_| "Unable to verify session".to_string())?;
+    let user = users::table
+        .filter(users::id.eq(user_id))
+        .select(User::as_select())
+        .first::<User>(&mut conn)
+        .await
+        .map_err(|_| "Invalid or expired access token".to_string())?;
+
+    Ok(SessionIdentity {
+        decided: true,
+        user_id: Some(user.id),
+        display_name: Some(user.name),
+    })
 }
 
 async fn cleanup_participant_connection(
@@ -262,12 +377,31 @@ async fn handle_message(
     participant_name: &mut Option<String>,
     tx: &mpsc::UnboundedSender<SignalingMessage>,
     room_repo: &Arc<dyn RoomRepository>,
+    recent_chat_messages: &mut VecDeque<Instant>,
+    session_user_id: Option<Uuid>,
+    session_display_name: Option<&str>,
 ) {
     match message {
         SignalingMessage::Join {
             room_id,
             participant_name: name,
         } => {
+            if current_room_id.is_some() {
+                warn!(
+                    "Participant {} attempted to join more than one room",
+                    participant_id
+                );
+                return;
+            }
+
+            let name = session_display_name.unwrap_or(&name).trim().to_string();
+            if name.is_empty() || name.chars().count() > 80 {
+                let _ = tx.send(SignalingMessage::Error {
+                    message: "Participant name must be between 1 and 80 characters".to_string(),
+                });
+                return;
+            }
+
             info!(
                 "Participant {} ({}) joining room {}",
                 name, participant_id, room_id
@@ -293,9 +427,11 @@ async fn handle_message(
 
                 // Get list of existing participants before adding new one (including media states)
                 let existing_participants = room.get_participants_with_media_state();
+                let chat_history = room.chat_history();
 
                 // Create participant and add to room
-                let participant = Participant::new(participant_id.to_string(), name.clone());
+                let mut participant = Participant::new(participant_id.to_string(), name.clone());
+                participant.user_id = session_user_id;
                 let mut participant_conn = ParticipantConnection::new(participant, tx.clone());
 
                 // Create WebRTC peer connection for this participant
@@ -528,6 +664,10 @@ async fn handle_message(
                     participant_name: name,
                 });
 
+                let _ = tx.send(SignalingMessage::ChatHistory {
+                    messages: chat_history,
+                });
+
                 // Send list of existing participants to the new joiner (with media states)
                 for (id, name, audio_enabled, video_enabled) in existing_participants {
                     // Send ParticipantJoined first
@@ -558,6 +698,12 @@ async fn handle_message(
                     message: "Room not found".to_string(),
                 });
             }
+        }
+
+        SignalingMessage::Authenticate { .. } | SignalingMessage::Authenticated { .. } => {
+            let _ = tx.send(SignalingMessage::Error {
+                message: "Invalid signaling direction".to_string(),
+            });
         }
 
         SignalingMessage::Offer { target_id: _, sdp } => {
@@ -683,7 +829,7 @@ async fn handle_message(
                                                     {
                                                         // Send StreamOwner for each sender's stream
                                                         if let Some((first_track, _, _, _)) =
-                                                            track_tuples.first()
+                                                            track_tuples.as_slice().first()
                                                         {
                                                             let sender_name = sender_info
                                                                 .get(&sender_id)
@@ -751,6 +897,7 @@ async fn handle_message(
                                                                                 .get_parameters()
                                                                                 .await
                                                                                 .encodings
+                                                                                .as_slice()
                                                                                 .first()
                                                                                 .map(|encoding| encoding.ssrc)
                                                                                 .unwrap_or(0);
@@ -901,6 +1048,7 @@ async fn handle_message(
                                                                     .get_parameters()
                                                                     .await
                                                                     .encodings
+                                                                    .as_slice()
                                                                     .first()
                                                                 {
                                                                     Some(encoding) => encoding.ssrc,
@@ -1253,22 +1401,55 @@ async fn handle_message(
             participant_id: _,
             participant_name: _,
             message,
-            timestamp,
+            timestamp: _,
         } => {
-            // Broadcast chat message to all participants in the room (including sender)
             if let Some(room_id) = current_room_id {
                 if let Some(room_lock) = room_repo.get_room(room_id).await {
-                    let room = room_lock.read().await;
+                    let now = Instant::now();
+                    while recent_chat_messages
+                        .front()
+                        .is_some_and(|sent_at| now.duration_since(*sent_at) >= CHAT_RATE_WINDOW)
+                    {
+                        recent_chat_messages.pop_front();
+                    }
+                    if recent_chat_messages.len() >= CHAT_RATE_LIMIT {
+                        warn!("Rate-limited chat message from {}", participant_id);
+                        return;
+                    }
+
+                    let message = message.trim();
+                    if message.is_empty() || message.chars().count() > 2_000 {
+                        warn!("Rejected invalid chat message from {}", participant_id);
+                        return;
+                    }
+                    recent_chat_messages.push_back(now);
+
+                    let mut room = room_lock.write().await;
+                    if !room.allow_chat_message() {
+                        warn!("Rate-limited chat messages in room {}", room_id);
+                        return;
+                    }
                     let sender_name = participant_name
                         .clone()
                         .unwrap_or_else(|| "Unknown".to_string());
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let chat_message = ChatMessagePayload {
+                        participant_id: participant_id.to_string(),
+                        participant_name: sender_name.clone(),
+                        message: message.to_string(),
+                        timestamp,
+                    };
 
                     info!("💬 {} sent message in room {}", sender_name, room_id);
+                    room.record_chat_message(chat_message.clone());
                     room.broadcast(SignalingMessage::ChatMessage {
-                        participant_id: participant_id.to_string(),
-                        participant_name: sender_name,
-                        message,
-                        timestamp,
+                        participant_id: chat_message.participant_id,
+                        participant_name: chat_message.participant_name,
+                        message: chat_message.message,
+                        timestamp: chat_message.timestamp,
                     });
                 }
             }
