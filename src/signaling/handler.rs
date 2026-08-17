@@ -28,6 +28,7 @@ use crate::sfu::{
     room::Room,
 };
 use crate::signaling::message::{ChatMessagePayload, SignalingMessage};
+use crate::social::{SfuRoomAuthorization, authorize_sfu_room};
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
@@ -227,6 +228,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 &tx,
                                 &room_repo_clone,
                                 &mut recent_chat_messages,
+                                &state.pool,
                                 identity.user_id,
                                 identity.display_name.as_deref(),
                             )
@@ -378,6 +380,7 @@ async fn handle_message(
     tx: &mpsc::UnboundedSender<SignalingMessage>,
     room_repo: &Arc<dyn RoomRepository>,
     recent_chat_messages: &mut VecDeque<Instant>,
+    pool: &crate::db::DbPool,
     session_user_id: Option<Uuid>,
     session_display_name: Option<&str>,
 ) {
@@ -400,6 +403,28 @@ async fn handle_message(
                     message: "Participant name must be between 1 and 80 characters".to_string(),
                 });
                 return;
+            }
+
+            // Call-session rooms require an accepted authenticated member. This runs before
+            // touching in-memory room state, so denied joins cannot allocate SFU resources.
+            match authorize_sfu_room(pool, &room_id, session_user_id).await {
+                Ok(SfuRoomAuthorization::Legacy | SfuRoomAuthorization::Authorized) => {}
+                Ok(SfuRoomAuthorization::Denied) => {
+                    let _ = tx.send(SignalingMessage::Error {
+                        message: "Call session access denied".to_string(),
+                    });
+                    return;
+                }
+                Err(error) => {
+                    error!(
+                        "Failed to authorize call-session room {}: {}",
+                        room_id, error
+                    );
+                    let _ = tx.send(SignalingMessage::Error {
+                        message: "Unable to authorize call session".to_string(),
+                    });
+                    return;
+                }
             }
 
             info!(

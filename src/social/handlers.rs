@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
 };
@@ -16,11 +16,15 @@ use crate::{
     AppState,
     auth::{extract_user_id, models::User},
     schema::{call_invitations, friendships, meeting_history, user_presence, users},
-    social::models::{
-        CallInvitation, CallInvitationResponse, CreateCallRequest, CreateFriendRequest,
-        FriendRequestItem, FriendSummary, FriendsResponse, Friendship, MeetingHistory,
-        MeetingHistoryResponse, NewCallInvitation, NewFriendship, NewMeetingHistory,
-        RecordMeetingRequest, RespondToCallRequest, UserPresence,
+    social::{
+        conversation_routes,
+        models::{
+            CallInvitation, CallInvitationResponse, CreateCallRequest, CreateFriendRequest,
+            FriendRequestItem, FriendSummary, FriendsResponse, Friendship, MeetingHistory,
+            MeetingHistoryResponse, NewCallInvitation, NewFriendship, NewMeetingHistory,
+            RecordMeetingRequest, RespondToCallRequest, SearchUsersQuery, UserDiscovery,
+            UserPresence, UserProfile, UserStatus,
+        },
     },
 };
 
@@ -32,12 +36,126 @@ pub fn social_routes() -> Router<AppState> {
         .route("/friends", get(list_friends).post(create_friend_request))
         .route("/friends/{id}", delete(delete_friendship))
         .route("/friends/{id}/accept", post(accept_friend_request))
+        .route("/users", get(search_users))
+        .route("/users/{id}/profile", get(get_user_profile))
         .route("/presence", post(update_presence))
         .route("/calls", post(create_call_invitation))
         .route("/calls/incoming", get(list_incoming_calls))
         .route("/calls/{id}/respond", post(respond_to_call))
         .route("/meetings", get(list_meetings).post(record_meeting))
         .route("/meetings/{id}", delete(delete_meeting))
+        .route(
+            "/conversations/{id}/call-sessions",
+            post(crate::social::start_call_session),
+        )
+        .nest("/call-sessions", crate::social::call_session_routes())
+        .nest("/conversations", conversation_routes())
+}
+
+pub async fn search_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchUsersQuery>,
+) -> ApiResult<Vec<UserDiscovery>> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let query = validated_user_search_query(&query.query).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Query must be 2 to 80 characters".to_string(),
+    ))?;
+    let pattern = format!(
+        "%{}%",
+        query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+
+    let users: Vec<UserDiscovery> = users::table
+        .filter(users::id.ne(user_id))
+        .filter(users::name.ilike(&pattern).or(users::email.ilike(&pattern)))
+        .order((users::name.asc(), users::email.asc()))
+        .limit(10)
+        .select(UserDiscovery::as_select())
+        .load(&mut conn)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(users))
+}
+
+pub async fn get_user_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(target_user_id): Path<Uuid>,
+) -> ApiResult<UserProfile> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+
+    if target_user_id != user_id {
+        let is_friend = friendships::table
+            .filter(friendships::status.eq("accepted"))
+            .filter(
+                friendships::requester_id
+                    .eq(user_id)
+                    .and(friendships::addressee_id.eq(target_user_id))
+                    .or(friendships::requester_id
+                        .eq(target_user_id)
+                        .and(friendships::addressee_id.eq(user_id))),
+            )
+            .select(friendships::id)
+            .first::<Uuid>(&mut conn)
+            .await
+            .optional()
+            .map_err(internal_error)?
+            .is_some();
+        if !is_friend {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Profiles are limited to friends".to_string(),
+            ));
+        }
+    }
+
+    let user: User = users::table
+        .filter(users::id.eq(target_user_id))
+        .select(User::as_select())
+        .first(&mut conn)
+        .await
+        .map_err(|error| match error {
+            diesel::result::Error::NotFound => {
+                (StatusCode::NOT_FOUND, "User not found".to_string())
+            }
+            _ => internal_error(error),
+        })?;
+    let last_seen_at = user_presence::table
+        .filter(user_presence::user_id.eq(target_user_id))
+        .select(user_presence::last_seen_at)
+        .first::<DateTime<Utc>>(&mut conn)
+        .await
+        .optional()
+        .map_err(internal_error)?;
+    let status = UserStatus::from_db_value(&user.status).ok_or_else(|| {
+        tracing::error!(user_id = %user.id, status = %user.status, "Invalid persisted user status");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Profile unavailable".to_string(),
+        )
+    })?;
+    let online_after = Utc::now() - Duration::seconds(45);
+
+    Ok(Json(UserProfile {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        status,
+        status_message: user.status_message,
+        created_at: user.created_at,
+        is_online: last_seen_at
+            .as_ref()
+            .is_some_and(|last_seen_at| *last_seen_at > online_after),
+        last_seen_at,
+    }))
 }
 
 pub async fn list_friends(
@@ -653,6 +771,11 @@ fn is_valid_room_id(room_id: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+fn validated_user_search_query(query: &str) -> Option<&str> {
+    let query = query.trim();
+    (2..=80).contains(&query.chars().count()).then_some(query)
+}
+
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     tracing::error!("Social API error: {error}");
     (
@@ -663,7 +786,7 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_valid_room_id;
+    use super::{is_valid_room_id, validated_user_search_query};
 
     #[test]
     fn validates_room_ids() {
@@ -671,5 +794,13 @@ mod tests {
         assert!(!is_valid_room_id(""));
         assert!(!is_valid_room_id("room with spaces"));
         assert!(!is_valid_room_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn validates_user_search_queries() {
+        assert_eq!(validated_user_search_query("  Ada  "), Some("Ada"));
+        assert_eq!(validated_user_search_query(" "), None);
+        assert_eq!(validated_user_search_query("a"), None);
+        assert_eq!(validated_user_search_query(&"a".repeat(81)), None);
     }
 }

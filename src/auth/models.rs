@@ -16,6 +16,8 @@ pub struct User {
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub role: String,
+    pub status: String,
+    pub status_message: String,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
