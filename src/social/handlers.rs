@@ -9,15 +9,18 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::Uuid as SqlUuid;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{
+    AsyncConnection, AsyncPgConnection, RunQueryDsl, scoped_futures::ScopedFutureExt,
+};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     AppState,
     auth::{extract_user_id, models::User},
-    schema::{call_invitations, friendships, meeting_history, user_presence, users},
+    schema::{call_invitations, friendships, meeting_history, notifications, user_presence, users},
     social::{
-        conversation_routes,
+        conversation_routes, create_notification,
         models::{
             CallInvitation, CallInvitationResponse, CreateCallRequest, CreateFriendRequest,
             FriendRequestItem, FriendSummary, FriendsResponse, Friendship, MeetingHistory,
@@ -25,6 +28,7 @@ use crate::{
             RecordMeetingRequest, RespondToCallRequest, SearchUsersQuery, UserDiscovery,
             UserPresence, UserProfile, UserStatus,
         },
+        notification_routes,
     },
 };
 
@@ -44,6 +48,7 @@ pub fn social_routes() -> Router<AppState> {
         .route("/calls/{id}/respond", post(respond_to_call))
         .route("/meetings", get(list_meetings).post(record_meeting))
         .route("/meetings/{id}", delete(delete_meeting))
+        .nest("/notifications", notification_routes())
         .route(
             "/conversations/{id}/call-sessions",
             post(crate::social::start_call_session),
@@ -214,6 +219,7 @@ pub async fn list_friends(
                 name: user.name,
                 email: user.email,
                 is_online: presence_by_user.get(&user.id).copied().unwrap_or(false),
+                friendship_id: None,
             };
             (summary.id, summary)
         })
@@ -227,9 +233,10 @@ pub async fn list_friends(
         } else {
             relationship.requester_id
         };
-        let Some(user) = users_by_id.get(&related_id).cloned() else {
+        let Some(mut user) = users_by_id.get(&related_id).cloned() else {
             continue;
         };
+        user.friendship_id = Some(relationship.id);
 
         if relationship.status == "accepted" {
             friends.push(user);
@@ -272,12 +279,29 @@ pub async fn create_friend_request(
         return Ok(StatusCode::NO_CONTENT);
     };
 
-    let result = diesel::insert_into(friendships::table)
-        .values(&NewFriendship {
-            requester_id: user_id,
-            addressee_id: target.id,
+    let result = conn
+        .transaction(|conn| {
+            async move {
+                let friendship: Friendship = diesel::insert_into(friendships::table)
+                    .values(NewFriendship {
+                        requester_id: user_id,
+                        addressee_id: target.id,
+                    })
+                    .returning(Friendship::as_returning())
+                    .get_result(conn)
+                    .await?;
+                create_notification(
+                    conn,
+                    target.id,
+                    user_id,
+                    "friendRequest",
+                    json!({ "friendshipId": friendship.id }),
+                )
+                .await?;
+                Ok(())
+            }
+            .scope_boxed()
         })
-        .execute(&mut conn)
         .await;
 
     match result {
@@ -331,22 +355,59 @@ pub async fn delete_friendship(
 ) -> EmptyResult {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let deleted = diesel::delete(
-        friendships::table
-            .filter(friendships::id.eq(friendship_id))
-            .filter(
-                friendships::requester_id
-                    .eq(user_id)
-                    .or(friendships::addressee_id.eq(user_id)),
-            ),
-    )
-    .execute(&mut conn)
-    .await
-    .map_err(internal_error)?;
+    let friendship: Friendship = conn
+        .transaction(|conn| {
+            async move {
+                let friendship: Friendship = diesel::delete(
+                    friendships::table
+                        .filter(friendships::id.eq(friendship_id))
+                        .filter(
+                            friendships::requester_id
+                                .eq(user_id)
+                                .or(friendships::addressee_id.eq(user_id)),
+                        ),
+                )
+                .returning(Friendship::as_returning())
+                .get_result(conn)
+                .await?;
+                if friendship.status == "accepted" {
+                    let recipient_id = if friendship.requester_id == user_id {
+                        friendship.addressee_id
+                    } else {
+                        friendship.requester_id
+                    };
+                    create_notification(
+                        conn,
+                        recipient_id,
+                        user_id,
+                        "friendRemoved",
+                        json!({ "friendshipId": friendship.id }),
+                    )
+                    .await?;
+                } else {
+                    diesel::delete(
+                        notifications::table
+                            .filter(notifications::recipient_id.eq(friendship.addressee_id))
+                            .filter(notifications::actor_id.eq(friendship.requester_id))
+                            .filter(notifications::kind.eq("friendRequest"))
+                            .filter(notifications::read_at.is_null()),
+                    )
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(friendship)
+            }
+            .scope_boxed()
+        })
+        .await
+        .map_err(|error: diesel::result::Error| match error {
+            diesel::result::Error::NotFound => {
+                (StatusCode::NOT_FOUND, "Friendship not found".to_string())
+            }
+            _ => internal_error(error),
+        })?;
 
-    if deleted == 0 {
-        return Err((StatusCode::NOT_FOUND, "Friendship not found".to_string()));
-    }
+    tracing::debug!(friendship_id = %friendship.id, user_id = %user_id, "Friendship removed");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -599,6 +660,7 @@ pub async fn list_incoming_calls(
                 name: user.name,
                 email: user.email,
                 is_online: presence_by_user.get(&user.id).copied().unwrap_or(false),
+                friendship_id: None,
             };
             (summary.id, summary)
         })

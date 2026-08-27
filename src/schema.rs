@@ -116,6 +116,19 @@ diesel::table! {
 }
 
 diesel::table! {
+    notifications (id) {
+        id -> Uuid,
+        recipient_id -> Uuid,
+        actor_id -> Uuid,
+        #[max_length = 64]
+        kind -> Varchar,
+        data -> Jsonb,
+        created_at -> Timestamptz,
+        read_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
     users (id) {
         id -> Uuid,
         #[max_length = 255]
@@ -171,6 +184,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     direct_message_requests,
     friendships,
     meeting_history,
+    notifications,
     refresh_tokens,
     user_presence,
     users,

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::schema::{
     call_invitations, call_session_members, call_sessions, conversation_members,
     conversation_messages, conversations, direct_message_requests, friendships, meeting_history,
-    user_presence, users,
+    notifications, user_presence, users,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -200,6 +200,28 @@ pub struct NewFriendship {
 }
 
 #[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = notifications)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct Notification {
+    pub id: Uuid,
+    pub recipient_id: Uuid,
+    pub actor_id: Uuid,
+    pub kind: String,
+    pub data: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub read_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = notifications)]
+pub struct NewNotification<'a> {
+    pub recipient_id: Uuid,
+    pub actor_id: Uuid,
+    pub kind: &'a str,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Queryable, Selectable)]
 #[diesel(table_name = call_invitations)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct CallInvitation {
@@ -357,6 +379,8 @@ pub struct FriendSummary {
     pub name: String,
     pub email: String,
     pub is_online: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub friendship_id: Option<Uuid>,
 }
 
 #[derive(Debug, Queryable, Selectable, Serialize)]
@@ -416,6 +440,17 @@ pub struct FriendRequestItem {
 pub struct FriendsResponse {
     pub friends: Vec<FriendSummary>,
     pub incoming_requests: Vec<FriendRequestItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationResponse {
+    pub id: Uuid,
+    pub kind: String,
+    pub actor_id: Uuid,
+    pub actor_name: String,
+    pub data: serde_json::Value,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
