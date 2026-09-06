@@ -2,7 +2,7 @@
 # Stage 2: prod    - Minimal runtime image with just binary
 
 # --- Stage 1: Builder ---
-FROM rust:1.91.1-bookworm AS builder
+FROM rust:1.95.0-bookworm AS builder
 
 # Install build dependencies including PostgreSQL client library
 RUN apt-get update && apt-get install -y --no-install-recommends \
