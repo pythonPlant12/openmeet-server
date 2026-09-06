@@ -8,7 +8,7 @@ edition = "2024"
 tokio = { version = "1.49", features = ["full"] }
 
 # Web framework
-axum = { version = "0.8.8", features = ["ws"] }
+axum = { version = "0.8.8", features = ["ws", "multipart"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rustls = { version = "0.23.36", features = ["ring"] }
 
@@ -34,14 +34,19 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 
+# Object storage
+aws-config = { version = "=1.8.16", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"] }
+aws-credential-types = "=1.2.14"
+aws-sdk-s3 = "=1.130.0"
+
 # Database
-diesel = { version = "2.3.5", features = ["postgres", "uuid", "chrono"] }
+diesel = { version = "2.3.5", features = ["postgres", "uuid", "chrono", "serde_json"] }
 diesel-async = { version = "0.8.0", features = ["postgres", "deadpool"] }
 diesel_migrations = "2.2"
 
 # Auth
 argon2 = "0.5"
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 sha2 = "0.11"
 rand = "0.10"
 

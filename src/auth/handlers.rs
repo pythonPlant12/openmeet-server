@@ -28,6 +28,10 @@ pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<AuthResponse> {
+    let nickname = normalize_nickname(&req.nickname).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Nickname must be 3 to 50 lowercase letters, numbers, or underscores".to_string(),
+    ))?;
     let mut conn = state
         .pool
         .get()
@@ -45,6 +49,7 @@ pub async fn register(
     let new_user = NewUser {
         email: req.email.clone(),
         name: req.name,
+        nickname,
         password_hash,
         role: "user".to_string(),
     };
@@ -58,7 +63,10 @@ pub async fn register(
             diesel::result::Error::DatabaseError(
                 diesel::result::DatabaseErrorKind::UniqueViolation,
                 _,
-            ) => (StatusCode::CONFLICT, "Email already exists".to_string()),
+            ) => (
+                StatusCode::CONFLICT,
+                "Email or nickname already exists".to_string(),
+            ),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         })?;
 
@@ -70,6 +78,15 @@ pub async fn register(
         access_token,
         refresh_token,
     }))
+}
+
+fn normalize_nickname(value: &str) -> Option<String> {
+    let nickname = value.trim().to_lowercase();
+    ((3..=50).contains(&nickname.len())
+        && nickname.bytes().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == b'_'
+        }))
+    .then_some(nickname)
 }
 
 // POST /auth/login
@@ -236,7 +253,7 @@ async fn create_tokens(
 }
 
 // Helper: extract user ID from Authorization header
-fn extract_user_id(
+pub(crate) fn extract_user_id(
     jwt: &JwtConfig,
     headers: &header::HeaderMap,
 ) -> Result<uuid::Uuid, (StatusCode, String)> {

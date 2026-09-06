@@ -13,9 +13,13 @@ pub struct User {
     pub id: Uuid,
     pub email: String,
     pub name: String,
+    pub nickname: String,
+    pub avatar_key: Option<String>,
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub role: String,
+    pub status: String,
+    pub status_message: String,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -26,6 +30,7 @@ pub struct User {
 pub struct NewUser {
     pub email: String,
     pub name: String,
+    pub nickname: String,
     pub password_hash: String,
     pub role: String,
 }
@@ -55,6 +60,7 @@ pub struct NewRefreshToken {
 pub struct RegisterRequest {
     pub email: String,
     pub name: String,
+    pub nickname: String,
     pub password: String,
 }
 
@@ -75,6 +81,7 @@ pub struct UserResponse {
     pub id: String,
     pub email: String,
     pub name: String,
+    pub nickname: String,
     pub role: String,
 }
 
@@ -96,6 +103,7 @@ impl From<User> for UserResponse {
             id: user.id.to_string(),
             email: user.email,
             name: user.name,
+            nickname: user.nickname,
             role: user.role,
         }
     }

@@ -2,47 +2,24 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-mod auth;
-mod db;
-mod schema;
-mod sfu;
-mod signaling;
-
-use axum::{Router, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
 use diesel::{Connection, PgConnection};
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
-use crate::auth::{JwtConfig, auth_routes};
-use crate::db::{DbPool, create_pool};
-use crate::sfu::repository::{InMemoryRoomRepository, RoomRepository};
-use crate::signaling::handler::websocket_handler;
+use openmeet_server::AppState;
+use openmeet_server::auth::JwtConfig;
+use openmeet_server::build_router;
+use openmeet_server::db::create_pool;
+use openmeet_server::sfu::repository::{InMemoryRoomRepository, RoomRepository};
+use openmeet_server::storage::S3AvatarStorage;
 
 // Embed migrations at compile time
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
-
-// Shared application state
-#[derive(Clone)]
-pub struct AppState {
-    pub pool: DbPool,
-    pub jwt: JwtConfig,
-    pub room_repo: Arc<dyn RoomRepository>,
-    pub metrics_handle: PrometheusHandle,
-}
-
-// Allows WebSocket handler to extract just room_repo from AppState
-// This way the handler doesn't need to know about auth-related fields
-impl axum::extract::FromRef<AppState> for Arc<dyn RoomRepository> {
-    fn from_ref(state: &AppState) -> Self {
-        Arc::clone(&state.room_repo)
-    }
-}
 
 #[tokio::main]
 async fn main() {
@@ -86,6 +63,17 @@ async fn main() {
     // Room repository (in-memory)
     let room_repo: Arc<dyn RoomRepository> = Arc::new(InMemoryRoomRepository::new());
 
+    let avatar_storage = Arc::new(
+        S3AvatarStorage::from_env()
+            .await
+            .expect("RustFS avatar storage must be configured"),
+    );
+    avatar_storage
+        .ensure_bucket()
+        .await
+        .expect("RustFS avatar bucket must be available");
+    info!("RustFS avatar storage initialized");
+
     // Initialize Prometheus metrics
     let metrics_handle = PrometheusBuilder::new()
         .install_recorder()
@@ -97,20 +85,11 @@ async fn main() {
         jwt,
         room_repo,
         metrics_handle,
+        enforce_room_access: std::env::var("ENFORCE_ROOM_ACCESS").as_deref() == Ok("true"),
+        avatar_storage,
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .route("/ws", get(websocket_handler))
-        .route("/metrics", get(metrics_handler))
-        .nest("/auth", auth_routes())
-        .layer(cors)
-        .with_state(state);
+    let app = build_router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8081));
     let use_tls = std::env::var("USE_TLS").unwrap_or_default() == "true";
@@ -144,12 +123,4 @@ async fn main() {
             .await
             .expect("Server failed to start");
     }
-}
-
-async fn health_check() -> &'static str {
-    "OK"
-}
-
-async fn metrics_handler(axum::extract::State(state): axum::extract::State<AppState>) -> String {
-    state.metrics_handle.render()
 }

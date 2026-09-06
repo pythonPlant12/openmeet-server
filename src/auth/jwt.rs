@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -41,12 +41,14 @@ impl JwtConfig {
             iat: now.timestamp(),
             exp: (now + Duration::minutes(self.access_token_minutes)).timestamp(),
         };
-        encode(&Header::default(), &claims, &self.encoding_key)
+        encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)
     }
 
     // Validate access token, return user ID
     pub fn validate_access_token(&self, token: &str) -> Result<Uuid, jsonwebtoken::errors::Error> {
-        let token_data = decode::<AccessClaims>(token, &self.decoding_key, &Validation::default())?;
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_required_spec_claims(&["exp", "iat", "sub"]);
+        let token_data = decode::<AccessClaims>(token, &self.decoding_key, &validation)?;
         Uuid::parse_str(&token_data.claims.sub)
             .map_err(|_| jsonwebtoken::errors::ErrorKind::InvalidSubject.into())
     }
@@ -70,5 +72,28 @@ impl JwtConfig {
     // Calculate refresh token expiration
     pub fn refresh_token_expires_at(&self) -> chrono::NaiveDateTime {
         (Utc::now() + Duration::days(self.refresh_token_days)).naive_utc()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_token_round_trips_with_pinned_algorithm() {
+        let jwt = JwtConfig::new("test-secret-long-enough", 15, 7);
+        let user_id = Uuid::new_v4();
+        let token = jwt.create_access_token(user_id).unwrap();
+
+        assert_eq!(jwt.validate_access_token(&token).unwrap(), user_id);
+    }
+
+    #[test]
+    fn token_signed_with_another_secret_is_rejected() {
+        let issuer = JwtConfig::new("issuer-secret", 15, 7);
+        let verifier = JwtConfig::new("verifier-secret", 15, 7);
+        let token = issuer.create_access_token(Uuid::new_v4()).unwrap();
+
+        assert!(verifier.validate_access_token(&token).is_err());
     }
 }
