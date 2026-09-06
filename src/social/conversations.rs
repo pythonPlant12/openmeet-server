@@ -9,7 +9,12 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::Utc;
-use diesel::prelude::*;
+use diesel::{
+    deserialize::QueryableByName,
+    prelude::*,
+    sql_query,
+    sql_types::{Array, BigInt, Uuid as SqlUuid},
+};
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use uuid::Uuid;
 
@@ -138,6 +143,20 @@ async fn list_conversations(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let message_counts = message_counts_for_conversations(
+        &mut conn,
+        user_id,
+        &response
+            .iter()
+            .map(|conversation| conversation.id)
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    for conversation in &mut response {
+        let counts = message_counts.get(&conversation.id);
+        conversation.message_count = counts.map(|counts| counts.message_count).unwrap_or(0);
+        conversation.unread_count = counts.map(|counts| counts.unread_count).unwrap_or(0);
+    }
     response.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
 
     Ok(Json(response))
@@ -999,9 +1018,55 @@ fn conversation_response(
         access_policy,
         role,
         other_user_id,
+        message_count: 0,
+        unread_count: 0,
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
     })
+}
+
+#[derive(QueryableByName)]
+struct ConversationMessageCounts {
+    #[diesel(sql_type = SqlUuid)]
+    conversation_id: Uuid,
+    #[diesel(sql_type = BigInt)]
+    message_count: i64,
+    #[diesel(sql_type = BigInt)]
+    unread_count: i64,
+}
+
+async fn message_counts_for_conversations(
+    conn: &mut diesel_async::AsyncPgConnection,
+    user_id: Uuid,
+    conversation_ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, ConversationMessageCounts>, (StatusCode, String)> {
+    if conversation_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let counts: Vec<ConversationMessageCounts> = sql_query(
+        "SELECT messages.conversation_id,
+                COUNT(*)::BIGINT AS message_count,
+                COUNT(*) FILTER (
+                    WHERE messages.sender_id <> $1
+                      AND messages.sequence > COALESCE(reads.last_read_sequence, 0)
+                )::BIGINT AS unread_count
+         FROM conversation_messages AS messages
+         LEFT JOIN conversation_read_states AS reads
+           ON reads.conversation_id = messages.conversation_id AND reads.user_id = $1
+         WHERE messages.conversation_id = ANY($2)
+         GROUP BY messages.conversation_id",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<Array<SqlUuid>, _>(conversation_ids.to_vec())
+    .load(conn)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(counts
+        .into_iter()
+        .map(|count| (count.conversation_id, count))
+        .collect())
 }
 
 fn group_policy(group: &Conversation) -> Result<GroupAccessPolicy, (StatusCode, String)> {

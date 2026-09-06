@@ -16,6 +16,7 @@ use openmeet_server::auth::JwtConfig;
 use openmeet_server::build_router;
 use openmeet_server::db::create_pool;
 use openmeet_server::sfu::repository::{InMemoryRoomRepository, RoomRepository};
+use openmeet_server::storage::S3AvatarStorage;
 
 // Embed migrations at compile time
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
@@ -62,6 +63,17 @@ async fn main() {
     // Room repository (in-memory)
     let room_repo: Arc<dyn RoomRepository> = Arc::new(InMemoryRoomRepository::new());
 
+    let avatar_storage = Arc::new(
+        S3AvatarStorage::from_env()
+            .await
+            .expect("RustFS avatar storage must be configured"),
+    );
+    avatar_storage
+        .ensure_bucket()
+        .await
+        .expect("RustFS avatar bucket must be available");
+    info!("RustFS avatar storage initialized");
+
     // Initialize Prometheus metrics
     let metrics_handle = PrometheusBuilder::new()
         .install_recorder()
@@ -74,6 +86,7 @@ async fn main() {
         room_repo,
         metrics_handle,
         enforce_room_access: std::env::var("ENFORCE_ROOM_ACCESS").as_deref() == Ok("true"),
+        avatar_storage,
     };
 
     let app = build_router(state);

@@ -4,7 +4,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::Utc;
-use diesel::prelude::*;
+use diesel::{
+    prelude::*,
+    sql_query,
+    sql_types::{BigInt, Uuid as SqlUuid},
+};
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use uuid::Uuid;
 
@@ -101,6 +105,7 @@ pub(crate) async fn list_messages(
     Query(query): Query<ListConversationMessagesQuery>,
 ) -> ApiResult<ConversationMessagesResponse> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
+    let is_latest_page = query.before.is_none();
     let (before, limit) = validate_message_page(query)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
     authorize_conversation_access(&mut conn, conversation_id, user_id).await?;
@@ -125,10 +130,41 @@ pub(crate) async fn list_messages(
         None
     };
 
+    if is_latest_page {
+        if let Some(latest_sequence) = messages.as_slice().first().map(|message| message.sequence) {
+            mark_messages_read(&mut conn, conversation_id, user_id, latest_sequence).await?;
+        }
+    }
+
     Ok(Json(ConversationMessagesResponse {
         messages: messages.into_iter().map(message_response).collect(),
         next_before,
     }))
+}
+
+async fn mark_messages_read(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    latest_sequence: i64,
+) -> Result<(), (StatusCode, String)> {
+    sql_query(
+        "INSERT INTO conversation_read_states (conversation_id, user_id, last_read_sequence)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (conversation_id, user_id) DO UPDATE
+         SET last_read_sequence = GREATEST(
+                 conversation_read_states.last_read_sequence,
+                 EXCLUDED.last_read_sequence
+             ),
+             updated_at = NOW()",
+    )
+    .bind::<SqlUuid, _>(conversation_id)
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<BigInt, _>(latest_sequence)
+    .execute(conn)
+    .await
+    .map_err(internal_error)?;
+    Ok(())
 }
 
 async fn authorize_conversation_access(

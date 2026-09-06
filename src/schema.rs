@@ -62,6 +62,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    conversation_read_states (conversation_id, user_id) {
+        conversation_id -> Uuid,
+        user_id -> Uuid,
+        last_read_sequence -> Int8,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     conversations (id) {
         id -> Uuid,
         #[max_length = 10]
@@ -135,6 +144,10 @@ diesel::table! {
         email -> Varchar,
         #[max_length = 255]
         name -> Varchar,
+        #[max_length = 50]
+        nickname -> Varchar,
+        #[max_length = 255]
+        avatar_key -> Nullable<Varchar>,
         #[max_length = 255]
         password_hash -> Varchar,
         #[max_length = 50]
@@ -171,6 +184,8 @@ diesel::joinable!(refresh_tokens -> users (user_id));
 diesel::joinable!(conversation_members -> conversations (conversation_id));
 diesel::joinable!(conversation_messages -> conversations (conversation_id));
 diesel::joinable!(conversation_messages -> users (sender_id));
+diesel::joinable!(conversation_read_states -> conversations (conversation_id));
+diesel::joinable!(conversation_read_states -> users (user_id));
 diesel::joinable!(call_session_members -> call_sessions (call_session_id));
 diesel::joinable!(call_sessions -> conversations (conversation_id));
 
@@ -180,6 +195,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     call_sessions,
     conversation_members,
     conversation_messages,
+    conversation_read_states,
     conversations,
     direct_message_requests,
     friendships,

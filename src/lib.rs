@@ -4,6 +4,7 @@ pub mod schema;
 pub mod sfu;
 pub mod signaling;
 pub mod social;
+pub mod storage;
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use db::DbPool;
 use sfu::repository::RoomRepository;
 use signaling::handler::websocket_handler;
 use social::social_routes;
+use storage::AvatarStorage;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -28,6 +30,7 @@ pub struct AppState {
     pub room_repo: Arc<dyn RoomRepository>,
     pub metrics_handle: PrometheusHandle,
     pub enforce_room_access: bool,
+    pub avatar_storage: Arc<dyn AvatarStorage>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<dyn RoomRepository> {
@@ -63,7 +66,13 @@ fn cors_layer() -> CorsLayer {
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 

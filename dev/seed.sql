@@ -30,18 +30,19 @@ WHERE email IN ('test@test.com', 'alice@test.com', 'bob@test.com', 'carol@test.c
     ('test1@test.com', '00000000-0000-0000-0000-000000000007')
 );
 
-INSERT INTO users (id, email, name, password_hash, role)
+INSERT INTO users (id, email, name, nickname, password_hash, role)
 VALUES
-    ('00000000-0000-0000-0000-000000000001', 'test@test.com', 'Test User', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
-    ('00000000-0000-0000-0000-000000000002', 'alice@test.com', 'Alice Martin', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
-    ('00000000-0000-0000-0000-000000000003', 'bob@test.com', 'Bob Chen', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
-    ('00000000-0000-0000-0000-000000000004', 'carol@test.com', 'Carol Diaz', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
-    ('00000000-0000-0000-0000-000000000005', 'dave@test.com', 'Dave Wilson', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
-    ('00000000-0000-0000-0000-000000000006', 'eve@test.com', 'Eve Park', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
-    ('00000000-0000-0000-0000-000000000007', 'test1@test.com', 'Test One', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user')
+    ('00000000-0000-0000-0000-000000000001', 'test@test.com', 'Test User', 'test', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
+    ('00000000-0000-0000-0000-000000000002', 'alice@test.com', 'Alice Martin', 'alice', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
+    ('00000000-0000-0000-0000-000000000003', 'bob@test.com', 'Bob Chen', 'bob', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
+    ('00000000-0000-0000-0000-000000000004', 'carol@test.com', 'Carol Diaz', 'carol', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
+    ('00000000-0000-0000-0000-000000000005', 'dave@test.com', 'Dave Wilson', 'dave', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
+    ('00000000-0000-0000-0000-000000000006', 'eve@test.com', 'Eve Park', 'eve', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user'),
+    ('00000000-0000-0000-0000-000000000007', 'test1@test.com', 'Test One', 'test1', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'user')
 ON CONFLICT (id) DO UPDATE SET
     email = EXCLUDED.email,
     name = EXCLUDED.name,
+    nickname = EXCLUDED.nickname,
     password_hash = EXCLUDED.password_hash;
 
 INSERT INTO friendships (id, requester_id, addressee_id, status)

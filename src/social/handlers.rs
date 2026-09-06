@@ -2,8 +2,10 @@ use std::collections::HashMap;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    body::Body,
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
     routing::{delete, get, post},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -25,8 +27,8 @@ use crate::{
             CallInvitation, CallInvitationResponse, CreateCallRequest, CreateFriendRequest,
             FriendRequestItem, FriendSummary, FriendsResponse, Friendship, MeetingHistory,
             MeetingHistoryResponse, NewCallInvitation, NewFriendship, NewMeetingHistory,
-            RecordMeetingRequest, RespondToCallRequest, SearchUsersQuery, UserDiscovery,
-            UserPresence, UserProfile, UserStatus,
+            RecordMeetingRequest, RespondToCallRequest, SearchUsersQuery, UpdateSelfProfileRequest,
+            UserDiscovery, UserPresence, UserProfile, UserStatus,
         },
         notification_routes,
     },
@@ -35,6 +37,8 @@ use crate::{
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 type EmptyResult = Result<StatusCode, (StatusCode, String)>;
 
+const MAX_AVATAR_BYTES: usize = 5 * 1024 * 1024;
+
 pub fn social_routes() -> Router<AppState> {
     Router::new()
         .route("/friends", get(list_friends).post(create_friend_request))
@@ -42,6 +46,15 @@ pub fn social_routes() -> Router<AppState> {
         .route("/friends/{id}/accept", post(accept_friend_request))
         .route("/users", get(search_users))
         .route("/users/{id}/profile", get(get_user_profile))
+        .route("/users/{id}/avatar", get(get_user_avatar))
+        .route(
+            "/me/profile",
+            get(get_self_profile).patch(update_self_profile),
+        )
+        .route(
+            "/me/profile/avatar",
+            post(upload_avatar).layer(DefaultBodyLimit::max(MAX_AVATAR_BYTES)),
+        )
         .route("/presence", post(update_presence))
         .route("/calls", post(create_call_invitation))
         .route("/calls/incoming", get(list_incoming_calls))
@@ -97,30 +110,7 @@ pub async fn get_user_profile(
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
 
-    if target_user_id != user_id {
-        let is_friend = friendships::table
-            .filter(friendships::status.eq("accepted"))
-            .filter(
-                friendships::requester_id
-                    .eq(user_id)
-                    .and(friendships::addressee_id.eq(target_user_id))
-                    .or(friendships::requester_id
-                        .eq(target_user_id)
-                        .and(friendships::addressee_id.eq(user_id))),
-            )
-            .select(friendships::id)
-            .first::<Uuid>(&mut conn)
-            .await
-            .optional()
-            .map_err(internal_error)?
-            .is_some();
-        if !is_friend {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Profiles are limited to friends".to_string(),
-            ));
-        }
-    }
+    authorize_profile_access(&mut conn, user_id, target_user_id).await?;
 
     let user: User = users::table
         .filter(users::id.eq(target_user_id))
@@ -140,27 +130,212 @@ pub async fn get_user_profile(
         .await
         .optional()
         .map_err(internal_error)?;
-    let status = UserStatus::from_db_value(&user.status).ok_or_else(|| {
-        tracing::error!(user_id = %user.id, status = %user.status, "Invalid persisted user status");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Profile unavailable".to_string(),
-        )
-    })?;
-    let online_after = Utc::now() - Duration::seconds(45);
+    Ok(Json(profile_response(user, last_seen_at)?))
+}
 
-    Ok(Json(UserProfile {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        status,
-        status_message: user.status_message,
-        created_at: user.created_at,
-        is_online: last_seen_at
-            .as_ref()
-            .is_some_and(|last_seen_at| *last_seen_at > online_after),
-        last_seen_at,
-    }))
+pub async fn get_user_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+) -> Result<Response, (StatusCode, String)> {
+    let requester_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    authorize_profile_access(&mut conn, requester_id, user_id).await?;
+    let avatar_key = users::table
+        .filter(users::id.eq(user_id))
+        .select(users::avatar_key)
+        .first::<Option<String>>(&mut conn)
+        .await
+        .map_err(user_not_found)?
+        .ok_or((StatusCode::NOT_FOUND, "Avatar not found".to_string()))?;
+    let avatar = state
+        .avatar_storage
+        .download(&avatar_key)
+        .await
+        .map_err(storage_error)?;
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, avatar.content_type)
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::from(avatar.bytes))
+        .map_err(internal_error)
+}
+
+pub async fn get_self_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<UserProfile> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let user: User = users::table
+        .filter(users::id.eq(user_id))
+        .select(User::as_select())
+        .first(&mut conn)
+        .await
+        .map_err(user_not_found)?;
+    let last_seen_at = user_presence::table
+        .filter(user_presence::user_id.eq(user_id))
+        .select(user_presence::last_seen_at)
+        .first::<DateTime<Utc>>(&mut conn)
+        .await
+        .optional()
+        .map_err(internal_error)?;
+
+    Ok(Json(profile_response(user, last_seen_at)?))
+}
+
+pub async fn update_self_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateSelfProfileRequest>,
+) -> ApiResult<UserProfile> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let existing: User = users::table
+        .filter(users::id.eq(user_id))
+        .select(User::as_select())
+        .first(&mut conn)
+        .await
+        .map_err(user_not_found)?;
+
+    let name = match request.name {
+        Some(name) => normalize_name(&name).ok_or((
+            StatusCode::BAD_REQUEST,
+            "Name must be 1 to 255 characters".to_string(),
+        ))?,
+        None => existing.name,
+    };
+    let nickname = match request.nickname {
+        Some(nickname) => normalize_nickname(&nickname).ok_or((
+            StatusCode::BAD_REQUEST,
+            "Nickname must be 3 to 50 lowercase letters, numbers, or underscores".to_string(),
+        ))?,
+        None => existing.nickname,
+    };
+    let status = request
+        .status
+        .map(UserStatus::as_db_value)
+        .unwrap_or(&existing.status)
+        .to_string();
+    let status_message = match request.status_message {
+        Some(status_message) => normalize_status_message(&status_message).ok_or((
+            StatusCode::BAD_REQUEST,
+            "Status message must be at most 255 characters".to_string(),
+        ))?,
+        None => existing.status_message,
+    };
+
+    let user: User = diesel::update(users::table.filter(users::id.eq(user_id)))
+        .set((
+            users::name.eq(name),
+            users::nickname.eq(nickname),
+            users::status.eq(status),
+            users::status_message.eq(status_message),
+            users::updated_at.eq(Utc::now().naive_utc()),
+        ))
+        .returning(User::as_returning())
+        .get_result(&mut conn)
+        .await
+        .map_err(|error| match error {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _,
+            ) => (StatusCode::CONFLICT, "Nickname already exists".to_string()),
+            _ => internal_error(error),
+        })?;
+
+    Ok(Json(profile_response(user, None)?))
+}
+
+pub async fn upload_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> ApiResult<UserProfile> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut avatar = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
+        if field.name() != Some("avatar") || avatar.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Submit exactly one avatar file".to_string(),
+            ));
+        }
+        let content_type = field.content_type().map(str::to_owned).ok_or((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Avatar content type is required".to_string(),
+        ))?;
+        let extension = avatar_extension(&content_type).ok_or((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Avatar must be a JPEG, PNG, WebP, or GIF image".to_string(),
+        ))?;
+        let bytes = field.bytes().await.map_err(multipart_error)?;
+        if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Avatar must be between 1 byte and 5 MiB".to_string(),
+            ));
+        }
+        if !has_image_signature(&content_type, &bytes) {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Avatar contents do not match its image type".to_string(),
+            ));
+        }
+        avatar = Some((content_type, extension, bytes.to_vec()));
+    }
+
+    let Some((content_type, extension, bytes)) = avatar else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Avatar file is required".to_string(),
+        ));
+    };
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let previous_avatar_key = users::table
+        .filter(users::id.eq(user_id))
+        .select(users::avatar_key)
+        .first::<Option<String>>(&mut conn)
+        .await
+        .map_err(user_not_found)?;
+    let key = format!("avatars/{user_id}/{}.{}", Uuid::new_v4(), extension);
+    state
+        .avatar_storage
+        .upload(&key, &content_type, bytes)
+        .await
+        .map_err(storage_error)?;
+
+    let update_result: Result<User, diesel::result::Error> =
+        diesel::update(users::table.filter(users::id.eq(user_id)))
+            .set((
+                users::avatar_key.eq(Some(&key)),
+                users::updated_at.eq(Utc::now().naive_utc()),
+            ))
+            .returning(User::as_returning())
+            .get_result(&mut conn)
+            .await;
+    let user = match update_result {
+        Ok(user) => user,
+        Err(error) => {
+            if let Err(delete_error) = state.avatar_storage.delete(&key).await {
+                tracing::error!(%delete_error, avatar_key = %key, "Failed to remove orphaned avatar");
+            }
+            return Err(user_not_found(error));
+        }
+    };
+
+    if let Some(previous_key) = previous_avatar_key
+        .as_deref()
+        .filter(|previous| *previous != key.as_str())
+    {
+        if let Err(error) = state.avatar_storage.delete(previous_key).await {
+            tracing::warn!(%error, avatar_key = %previous_key, "Failed to remove replaced avatar");
+        }
+    }
+
+    Ok(Json(profile_response(user, None)?))
 }
 
 pub async fn list_friends(
@@ -279,6 +454,29 @@ pub async fn create_friend_request(
         return Ok(StatusCode::NO_CONTENT);
     };
 
+    let existing: Option<Friendship> = friendships::table
+        .filter(
+            friendships::requester_id
+                .eq(user_id)
+                .and(friendships::addressee_id.eq(target.id))
+                .or(friendships::requester_id
+                    .eq(target.id)
+                    .and(friendships::addressee_id.eq(user_id))),
+        )
+        .select(Friendship::as_select())
+        .first(&mut conn)
+        .await
+        .optional()
+        .map_err(internal_error)?;
+    if let Some(existing) = existing {
+        let message = if existing.status == "accepted" {
+            "Already friends"
+        } else {
+            "Friend request already pending"
+        };
+        return Err((StatusCode::CONFLICT, message.to_string()));
+    }
+
     let result = conn
         .transaction(|conn| {
             async move {
@@ -305,15 +503,21 @@ pub async fn create_friend_request(
         .await;
 
     match result {
-        Ok(_)
-        | Err(diesel::result::Error::DatabaseError(
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(diesel::result::Error::DatabaseError(
             diesel::result::DatabaseErrorKind::UniqueViolation,
             _,
-        ))
-        | Err(diesel::result::Error::DatabaseError(
+        )) => Err((
+            StatusCode::CONFLICT,
+            "Friend request already pending".to_string(),
+        )),
+        Err(diesel::result::Error::DatabaseError(
             diesel::result::DatabaseErrorKind::CheckViolation,
             _,
-        )) => Ok(StatusCode::NO_CONTENT),
+        )) => Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid friend request".to_string(),
+        )),
         Err(error) => Err(internal_error(error)),
     }
 }
@@ -833,6 +1037,143 @@ fn is_valid_room_id(room_id: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+fn profile_response(
+    user: User,
+    last_seen_at: Option<DateTime<Utc>>,
+) -> Result<UserProfile, (StatusCode, String)> {
+    let status = UserStatus::from_db_value(&user.status).ok_or_else(|| {
+        tracing::error!(user_id = %user.id, status = %user.status, "Invalid persisted user status");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Profile unavailable".to_string(),
+        )
+    })?;
+    let online_after = Utc::now() - Duration::seconds(45);
+
+    Ok(UserProfile {
+        id: user.id,
+        name: user.name,
+        nickname: user.nickname,
+        email: user.email,
+        avatar_url: user
+            .avatar_key
+            .as_ref()
+            .map(|_| format!("/social/users/{}/avatar", user.id)),
+        status,
+        status_message: user.status_message,
+        created_at: user.created_at,
+        is_online: last_seen_at
+            .as_ref()
+            .is_some_and(|last_seen_at| *last_seen_at > online_after),
+        last_seen_at,
+    })
+}
+
+fn normalize_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (1..=255)
+        .contains(&value.chars().count())
+        .then(|| value.to_string())
+}
+
+fn normalize_nickname(value: &str) -> Option<String> {
+    let nickname = value.trim().to_lowercase();
+    ((3..=50).contains(&nickname.len())
+        && nickname.bytes().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == b'_'
+        }))
+    .then_some(nickname)
+}
+
+fn normalize_status_message(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.chars().count() <= 255).then(|| value.to_string())
+}
+
+fn avatar_extension(content_type: &str) -> Option<&'static str> {
+    match image_media_type(content_type).as_str() {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+fn has_image_signature(content_type: &str, bytes: &[u8]) -> bool {
+    match image_media_type(content_type).as_str() {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        _ => false,
+    }
+}
+
+fn image_media_type(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+async fn authorize_profile_access(
+    conn: &mut diesel_async::AsyncPgConnection,
+    requester_id: Uuid,
+    target_user_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    if requester_id == target_user_id {
+        return Ok(());
+    }
+
+    let is_friend = friendships::table
+        .filter(friendships::status.eq("accepted"))
+        .filter(
+            friendships::requester_id
+                .eq(requester_id)
+                .and(friendships::addressee_id.eq(target_user_id))
+                .or(friendships::requester_id
+                    .eq(target_user_id)
+                    .and(friendships::addressee_id.eq(requester_id))),
+        )
+        .select(friendships::id)
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map_err(internal_error)?
+        .is_some();
+    if is_friend {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "Profiles are limited to friends".to_string(),
+        ))
+    }
+}
+
+fn multipart_error(error: axum::extract::multipart::MultipartError) -> (StatusCode, String) {
+    tracing::warn!(%error, "Invalid avatar upload");
+    (StatusCode::BAD_REQUEST, "Invalid avatar upload".to_string())
+}
+
+fn storage_error(error: anyhow::Error) -> (StatusCode, String) {
+    tracing::error!(%error, "Avatar storage error");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Avatar storage is unavailable".to_string(),
+    )
+}
+
+fn user_not_found(error: diesel::result::Error) -> (StatusCode, String) {
+    match error {
+        diesel::result::Error::NotFound => (StatusCode::NOT_FOUND, "User not found".to_string()),
+        _ => internal_error(error),
+    }
+}
+
 fn validated_user_search_query(query: &str) -> Option<&str> {
     let query = query.trim();
     (2..=80).contains(&query.chars().count()).then_some(query)
@@ -848,7 +1189,10 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_room_id, validated_user_search_query};
+    use super::{
+        avatar_extension, has_image_signature, is_valid_room_id, normalize_name,
+        normalize_nickname, normalize_status_message, validated_user_search_query,
+    };
 
     #[test]
     fn validates_room_ids() {
@@ -864,5 +1208,41 @@ mod tests {
         assert_eq!(validated_user_search_query(" "), None);
         assert_eq!(validated_user_search_query("a"), None);
         assert_eq!(validated_user_search_query(&"a".repeat(81)), None);
+    }
+
+    #[test]
+    fn validates_editable_profile_fields() {
+        assert_eq!(
+            normalize_name("  Ada Lovelace  "),
+            Some("Ada Lovelace".to_string())
+        );
+        assert_eq!(normalize_name(" "), None);
+        assert_eq!(normalize_nickname("Ada_42"), Some("ada_42".to_string()));
+        assert_eq!(normalize_nickname("ada-name"), None);
+        assert_eq!(normalize_status_message(&"a".repeat(255)).is_some(), true);
+        assert_eq!(normalize_status_message(&"a".repeat(256)), None);
+    }
+
+    #[test]
+    fn limits_avatar_content_types() {
+        assert_eq!(avatar_extension("image/png"), Some("png"));
+        assert_eq!(avatar_extension("image/svg+xml"), None);
+        assert_eq!(avatar_extension("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn rejects_mime_declared_images_without_matching_signatures() {
+        assert!(has_image_signature("image/png", b"\x89PNG\r\n\x1a\n"));
+        assert!(!has_image_signature("image/png", b"not an image"));
+        assert!(has_image_signature("image/webp", b"RIFFxxxxWEBP"));
+    }
+
+    #[test]
+    fn accepts_image_content_type_parameters() {
+        assert_eq!(avatar_extension("image/png; charset=binary"), Some("png"));
+        assert!(has_image_signature(
+            "image/png; charset=binary",
+            b"\x89PNG\r\n\x1a\nimage data"
+        ));
     }
 }

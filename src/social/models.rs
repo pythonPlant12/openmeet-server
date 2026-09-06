@@ -393,7 +393,7 @@ pub struct UserDiscovery {
     pub email: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum UserStatus {
     Available,
@@ -403,6 +403,15 @@ pub enum UserStatus {
 }
 
 impl UserStatus {
+    pub fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Away => "away",
+            Self::DoNotDisturb => "do_not_disturb",
+            Self::Offline => "offline",
+        }
+    }
+
     pub fn from_db_value(value: &str) -> Option<Self> {
         match value {
             "available" => Some(Self::Available),
@@ -419,12 +428,23 @@ impl UserStatus {
 pub struct UserProfile {
     pub id: Uuid,
     pub name: String,
+    pub nickname: String,
     pub email: String,
+    pub avatar_url: Option<String>,
     pub status: UserStatus,
     pub status_message: String,
     pub created_at: NaiveDateTime,
     pub last_seen_at: Option<DateTime<Utc>>,
     pub is_online: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSelfProfileRequest {
+    pub name: Option<String>,
+    pub nickname: Option<String>,
+    pub status: Option<UserStatus>,
+    pub status_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -512,6 +532,8 @@ pub struct ConversationResponse {
     pub access_policy: Option<GroupAccessPolicy>,
     pub role: Option<String>,
     pub other_user_id: Option<Uuid>,
+    pub message_count: i64,
+    pub unread_count: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
