@@ -17,10 +17,13 @@ use crate::{
     auth::extract_user_id,
     db::DbPool,
     schema::{call_session_members, call_sessions, conversation_members, conversations},
-    social::models::{
-        CallSession, CallSessionJoinResponse, CallSessionMember, CallSessionResponse,
-        CallSessionStartResponse, Conversation, IncomingCallSessionResponse, NewCallSession,
-        NewCallSessionMember, RespondToCallSessionRequest,
+    social::{
+        SocialResource,
+        models::{
+            CallSession, CallSessionJoinResponse, CallSessionMember, CallSessionResponse,
+            CallSessionStartResponse, Conversation, IncomingCallSessionResponse, NewCallSession,
+            NewCallSessionMember, RespondToCallSessionRequest,
+        },
     },
 };
 
@@ -75,7 +78,7 @@ pub async fn start_call_session(
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let now = Utc::now();
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let session: CallSession = conn
+    let (session, recipients): (CallSession, Vec<Uuid>) = conn
         .transaction(|conn| {
             async move {
                 let conversation = load_conversation_for_update(conn, conversation_id).await?;
@@ -107,7 +110,8 @@ pub async fn start_call_session(
                     .get_result(conn)
                     .await?;
                 let members = participant_ids
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|participant_id| NewCallSessionMember {
                         call_session_id: session.id,
                         user_id: participant_id,
@@ -124,12 +128,16 @@ pub async fn start_call_session(
                     .execute(conn)
                     .await?;
 
-                Ok(session)
+                Ok((session, participant_ids))
             }
             .scope_boxed()
         })
         .await
         .map_err(CallSessionError::into_api_error)?;
+
+    state
+        .social_events
+        .publish(recipients, SocialResource::Calls);
 
     Ok(Json(CallSessionStartResponse {
         id: session.id,
@@ -217,7 +225,7 @@ async fn respond_to_call_session(
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let now = Utc::now();
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let room_id: Option<String> = conn
+    let (room_id, recipients): (Option<String>, Vec<Uuid>) = conn
         .transaction(|conn| {
             async move {
                 expire_call_sessions(conn, now).await?;
@@ -251,6 +259,7 @@ async fn respond_to_call_session(
                         )),
                         _ => CallSessionError::from(error),
                     })?;
+                let recipients = call_session_member_ids(conn, call_session_id).await?;
                 let status = if request.accept {
                     "accepted"
                 } else {
@@ -269,9 +278,9 @@ async fn respond_to_call_session(
                 .await?;
 
                 if request.accept {
-                    Ok(Some(session.sfu_room_id))
+                    Ok((Some(session.sfu_room_id), recipients))
                 } else {
-                    Ok(None)
+                    Ok((None, recipients))
                 }
             }
             .scope_boxed()
@@ -279,7 +288,23 @@ async fn respond_to_call_session(
         .await
         .map_err(CallSessionError::into_api_error)?;
 
+    state
+        .social_events
+        .publish(recipients, SocialResource::Calls);
+
     Ok(Json(call_session_response(request.accept, room_id)))
+}
+
+async fn call_session_member_ids(
+    conn: &mut AsyncPgConnection,
+    call_session_id: Uuid,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    call_session_members::table
+        .filter(call_session_members::call_session_id.eq(call_session_id))
+        .select(call_session_members::user_id)
+        .load(conn)
+        .await
+        .map_err(internal_error)
 }
 
 /// Classifies an SFU room and authorizes accepted call-session participants.

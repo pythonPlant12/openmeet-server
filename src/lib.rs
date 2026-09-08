@@ -20,7 +20,7 @@ use auth::{JwtConfig, auth_routes};
 use db::DbPool;
 use sfu::repository::RoomRepository;
 use signaling::handler::websocket_handler;
-use social::social_routes;
+use social::{SocialEventHub, social_routes};
 use storage::AvatarStorage;
 
 #[derive(Clone)]
@@ -31,6 +31,7 @@ pub struct AppState {
     pub metrics_handle: PrometheusHandle,
     pub enforce_room_access: bool,
     pub avatar_storage: Arc<dyn AvatarStorage>,
+    pub social_events: SocialEventHub,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<dyn RoomRepository> {

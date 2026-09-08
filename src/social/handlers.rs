@@ -22,7 +22,7 @@ use crate::{
     auth::{extract_user_id, models::User},
     schema::{call_invitations, friendships, meeting_history, notifications, user_presence, users},
     social::{
-        conversation_routes, create_notification,
+        SocialResource, conversation_routes, create_notification,
         models::{
             CallInvitation, CallInvitationResponse, CreateCallRequest, CreateFriendRequest,
             FriendRequestItem, FriendSummary, FriendsResponse, Friendship, MeetingHistory,
@@ -56,6 +56,7 @@ pub fn social_routes() -> Router<AppState> {
             post(upload_avatar).layer(DefaultBodyLimit::max(MAX_AVATAR_BYTES)),
         )
         .route("/presence", post(update_presence))
+        .route("/events", get(crate::social::social_events_handler))
         .route("/calls", post(create_call_invitation))
         .route("/calls/incoming", get(list_incoming_calls))
         .route("/calls/{id}/respond", post(respond_to_call))
@@ -389,10 +390,15 @@ pub async fn list_friends(
     let users_by_id: HashMap<Uuid, FriendSummary> = related_users
         .into_iter()
         .map(|user| {
+            let avatar_url = user
+                .avatar_key
+                .as_ref()
+                .map(|_| format!("/social/users/{}/avatar", user.id));
             let summary = FriendSummary {
                 id: user.id,
                 name: user.name,
                 email: user.email,
+                avatar_url,
                 is_online: presence_by_user.get(&user.id).copied().unwrap_or(false),
                 friendship_id: None,
             };
@@ -503,7 +509,15 @@ pub async fn create_friend_request(
         .await;
 
     match result {
-        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Ok(_) => {
+            state
+                .social_events
+                .publish([target.id], SocialResource::Notifications);
+            state
+                .social_events
+                .publish([user_id, target.id], SocialResource::Friends);
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(diesel::result::Error::DatabaseError(
             diesel::result::DatabaseErrorKind::UniqueViolation,
             _,
@@ -529,7 +543,7 @@ pub async fn accept_friend_request(
 ) -> EmptyResult {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let updated = diesel::update(
+    let friendship: Friendship = diesel::update(
         friendships::table
             .filter(friendships::id.eq(friendship_id))
             .filter(friendships::addressee_id.eq(user_id))
@@ -539,16 +553,20 @@ pub async fn accept_friend_request(
         friendships::status.eq("accepted"),
         friendships::updated_at.eq(Utc::now()),
     ))
-    .execute(&mut conn)
+    .returning(Friendship::as_returning())
+    .get_result(&mut conn)
     .await
-    .map_err(internal_error)?;
-
-    if updated == 0 {
-        return Err((
+    .map_err(|error| match error {
+        diesel::result::Error::NotFound => (
             StatusCode::NOT_FOUND,
             "Friend request not found".to_string(),
-        ));
-    }
+        ),
+        _ => internal_error(error),
+    })?;
+    state.social_events.publish(
+        [friendship.requester_id, friendship.addressee_id],
+        SocialResource::Friends,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -612,6 +630,20 @@ pub async fn delete_friendship(
         })?;
 
     tracing::debug!(friendship_id = %friendship.id, user_id = %user_id, "Friendship removed");
+    state.social_events.publish(
+        [friendship.requester_id, friendship.addressee_id],
+        SocialResource::Friends,
+    );
+    if friendship.status == "accepted" {
+        let recipient_id = if friendship.requester_id == user_id {
+            friendship.addressee_id
+        } else {
+            friendship.requester_id
+        };
+        state
+            .social_events
+            .publish([recipient_id], SocialResource::Notifications);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -692,6 +724,10 @@ pub async fn create_call_invitation(
         .await
         .map_err(internal_error)?
     {
+        state.social_events.publish(
+            [invitation.caller_id, invitation.callee_id],
+            SocialResource::Calls,
+        );
         return Ok(Json(call_response(invitation, None)));
     }
 
@@ -767,14 +803,20 @@ pub async fn create_call_invitation(
         Err(error) => return Err(internal_error(error)),
     };
 
-    diesel::sql_query(
+    if let Err(error) = diesel::sql_query(
         "DELETE FROM call_invitations WHERE caller_id = $1 AND status <> 'pending' AND id NOT IN (SELECT id FROM call_invitations WHERE caller_id = $1 AND status <> 'pending' ORDER BY created_at DESC LIMIT 100)",
     )
     .bind::<SqlUuid, _>(invitation.caller_id)
     .execute(&mut conn)
     .await
-    .map_err(internal_error)?;
+    {
+        tracing::warn!(%error, caller_id = %invitation.caller_id, "Failed to prune old call invitations");
+    }
 
+    state.social_events.publish(
+        [invitation.caller_id, invitation.callee_id],
+        SocialResource::Calls,
+    );
     Ok(Json(call_response(invitation, None)))
 }
 
@@ -859,10 +901,15 @@ pub async fn list_incoming_calls(
     let callers_by_id: HashMap<Uuid, FriendSummary> = callers
         .into_iter()
         .map(|user| {
+            let avatar_url = user
+                .avatar_key
+                .as_ref()
+                .map(|_| format!("/social/users/{}/avatar", user.id));
             let summary = FriendSummary {
                 id: user.id,
                 name: user.name,
                 email: user.email,
+                avatar_url,
                 is_online: presence_by_user.get(&user.id).copied().unwrap_or(false),
                 friendship_id: None,
             };
@@ -916,6 +963,11 @@ pub async fn respond_to_call(
         ),
         _ => internal_error(error),
     })?;
+
+    state.social_events.publish(
+        [invitation.caller_id, invitation.callee_id],
+        SocialResource::Calls,
+    );
 
     Ok(Json(CallInvitationResponse {
         id: invitation.id,

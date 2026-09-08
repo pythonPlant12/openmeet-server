@@ -62,6 +62,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    conversation_hidden_states (conversation_id, user_id) {
+        conversation_id -> Uuid,
+        user_id -> Uuid,
+        hidden_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     conversation_read_states (conversation_id, user_id) {
         conversation_id -> Uuid,
         user_id -> Uuid,
@@ -184,6 +192,8 @@ diesel::joinable!(refresh_tokens -> users (user_id));
 diesel::joinable!(conversation_members -> conversations (conversation_id));
 diesel::joinable!(conversation_messages -> conversations (conversation_id));
 diesel::joinable!(conversation_messages -> users (sender_id));
+diesel::joinable!(conversation_hidden_states -> conversations (conversation_id));
+diesel::joinable!(conversation_hidden_states -> users (user_id));
 diesel::joinable!(conversation_read_states -> conversations (conversation_id));
 diesel::joinable!(conversation_read_states -> users (user_id));
 diesel::joinable!(call_session_members -> call_sessions (call_session_id));
@@ -195,6 +205,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     call_sessions,
     conversation_members,
     conversation_messages,
+    conversation_hidden_states,
     conversation_read_states,
     conversations,
     direct_message_requests,

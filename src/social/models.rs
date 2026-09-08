@@ -378,6 +378,7 @@ pub struct FriendSummary {
     pub id: Uuid,
     pub name: String,
     pub email: String,
+    pub avatar_url: Option<String>,
     pub is_online: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub friendship_id: Option<Uuid>,

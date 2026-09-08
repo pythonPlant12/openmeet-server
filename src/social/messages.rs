@@ -15,11 +15,17 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::extract_user_id,
-    schema::{conversation_members, conversation_messages, conversations, users},
-    social::models::{
-        Conversation, ConversationMessage, ConversationMessageResponse,
-        ConversationMessagesResponse, CreateConversationMessageRequest,
-        ListConversationMessagesQuery, NewConversationMessage,
+    schema::{
+        conversation_hidden_states, conversation_members, conversation_messages, conversations,
+        users,
+    },
+    social::{
+        SocialResource,
+        models::{
+            Conversation, ConversationMessage, ConversationMessageResponse,
+            ConversationMessagesResponse, CreateConversationMessageRequest,
+            ListConversationMessagesQuery, NewConversationMessage,
+        },
     },
 };
 
@@ -61,10 +67,11 @@ pub(crate) async fn create_message(
     let content = validate_message_content(&request.content)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
 
-    let message: ConversationMessage = conn
+    let (message, recipients): (ConversationMessage, Vec<Uuid>) = conn
         .transaction(|conn| {
             async move {
                 authorize_conversation_access(conn, conversation_id, user_id).await?;
+                let recipients = conversation_participants(conn, conversation_id).await?;
                 let sender_name = users::table
                     .find(user_id)
                     .select(users::name)
@@ -87,15 +94,56 @@ pub(crate) async fn create_message(
                     .execute(conn)
                     .await
                     .map_err(internal_error)?;
+                diesel::delete(
+                    conversation_hidden_states::table
+                        .filter(conversation_hidden_states::conversation_id.eq(conversation_id))
+                        .filter(conversation_hidden_states::user_id.ne(user_id)),
+                )
+                .execute(conn)
+                .await
+                .map_err(internal_error)?;
 
-                Ok(message)
+                Ok((message, recipients))
             }
             .scope_boxed()
         })
         .await
         .map_err(MessageError::into_api_error)?;
 
+    state
+        .social_events
+        .publish(recipients, SocialResource::Conversations);
+
     Ok((StatusCode::CREATED, Json(message_response(message))))
+}
+
+async fn conversation_participants(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conversation_id: Uuid,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    let conversation: Conversation = conversations::table
+        .find(conversation_id)
+        .select(Conversation::as_select())
+        .first(conn)
+        .await
+        .map_err(internal_error)?;
+
+    if conversation.kind == "direct" {
+        return Ok([
+            conversation.direct_user_low_id,
+            conversation.direct_user_high_id,
+        ]
+        .into_iter()
+        .flatten()
+        .collect());
+    }
+
+    conversation_members::table
+        .filter(conversation_members::conversation_id.eq(conversation_id))
+        .select(conversation_members::user_id)
+        .load(conn)
+        .await
+        .map_err(internal_error)
 }
 
 pub(crate) async fn list_messages(

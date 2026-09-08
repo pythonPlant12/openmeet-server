@@ -46,11 +46,20 @@ impl JwtConfig {
 
     // Validate access token, return user ID
     pub fn validate_access_token(&self, token: &str) -> Result<Uuid, jsonwebtoken::errors::Error> {
+        self.validate_access_token_with_expiration(token)
+            .map(|(user_id, _)| user_id)
+    }
+
+    pub fn validate_access_token_with_expiration(
+        &self,
+        token: &str,
+    ) -> Result<(Uuid, i64), jsonwebtoken::errors::Error> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_required_spec_claims(&["exp", "iat", "sub"]);
         let token_data = decode::<AccessClaims>(token, &self.decoding_key, &validation)?;
-        Uuid::parse_str(&token_data.claims.sub)
-            .map_err(|_| jsonwebtoken::errors::ErrorKind::InvalidSubject.into())
+        let user_id = Uuid::parse_str(&token_data.claims.sub)
+            .map_err(|_| jsonwebtoken::errors::ErrorKind::InvalidSubject)?;
+        Ok((user_id, token_data.claims.exp))
     }
 
     // Create random refresh token (NOT a JWT - just random UUID)

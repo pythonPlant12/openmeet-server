@@ -16,6 +16,7 @@ use openmeet_server::auth::JwtConfig;
 use openmeet_server::build_router;
 use openmeet_server::db::create_pool;
 use openmeet_server::sfu::repository::{InMemoryRoomRepository, RoomRepository};
+use openmeet_server::social::SocialEventHub;
 use openmeet_server::storage::S3AvatarStorage;
 
 // Embed migrations at compile time
@@ -87,6 +88,7 @@ async fn main() {
         metrics_handle,
         enforce_room_access: std::env::var("ENFORCE_ROOM_ACCESS").as_deref() == Ok("true"),
         avatar_storage,
+        social_events: SocialEventHub::new(),
     };
 
     let app = build_router(state);

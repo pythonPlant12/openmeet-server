@@ -11,6 +11,7 @@ use axum::{
 use chrono::Utc;
 use diesel::{
     deserialize::QueryableByName,
+    dsl::{exists, not},
     prelude::*,
     sql_query,
     sql_types::{Array, BigInt, Uuid as SqlUuid},
@@ -21,8 +22,12 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::extract_user_id,
-    schema::{conversation_members, conversations, direct_message_requests, friendships, users},
+    schema::{
+        conversation_hidden_states, conversation_members, conversations, direct_message_requests,
+        friendships, users,
+    },
     social::{
+        SocialResource,
         messages::{create_message, list_messages},
         models::{
             AddConversationMemberRequest, Conversation, ConversationKind, ConversationMember,
@@ -69,6 +74,7 @@ pub fn conversation_routes() -> Router<AppState> {
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/{id}/info", get(get_group_info))
         .route("/groups/{id}/join", post(join_group))
+        .route("/groups/{id}/leave", post(leave_group))
         .route("/groups/{id}/policy", post(update_group_policy))
         .route(
             "/groups/{id}/members",
@@ -89,6 +95,7 @@ pub fn conversation_routes() -> Router<AppState> {
             post(respond_to_direct_message_request),
         )
         .route("/{id}/messages", get(list_messages).post(create_message))
+        .route("/{id}", delete(hide_direct_conversation))
 }
 
 async fn list_conversations(
@@ -122,6 +129,11 @@ async fn list_conversations(
         .map_err(internal_error)?;
     let mut direct: Vec<Conversation> = conversations::table
         .filter(conversations::kind.eq("direct"))
+        .filter(not(exists(
+            conversation_hidden_states::table
+                .filter(conversation_hidden_states::conversation_id.eq(conversations::id))
+                .filter(conversation_hidden_states::user_id.eq(user_id)),
+        )))
         .filter(
             conversations::direct_user_low_id
                 .eq(user_id)
@@ -320,6 +332,8 @@ async fn join_group(
         .await
         .map_err(ConversationError::into_api_error)?;
 
+    publish_group_update(&state, &mut conn, group_id, &[]).await;
+
     Ok(Json(conversation_response(&group, user_id, Some(role))?))
 }
 
@@ -365,6 +379,8 @@ async fn update_group_policy(
         .await
         .map_err(ConversationError::into_api_error)?;
 
+    publish_group_update(&state, &mut conn, group_id, &[]).await;
+
     Ok(Json(conversation_response(&updated, user_id, Some(role))?))
 }
 
@@ -397,6 +413,8 @@ async fn add_group_member(
         .await
         .map_err(ConversationError::into_api_error)?;
 
+    publish_group_update(&state, &mut conn, group_id, &[]).await;
+
     Ok(Json(conversation_response(&group, user_id, Some(role))?))
 }
 
@@ -427,6 +445,84 @@ async fn remove_group_member(
         return Err((StatusCode::NOT_FOUND, "Group member not found".to_string()));
     }
     touch_group(&mut conn, group_id).await?;
+    publish_group_update(&state, &mut conn, group_id, &[member_id]).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn leave_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+) -> EmptyResult {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let group = load_group(&mut conn, group_id).await?;
+
+    if group.creator_id == user_id {
+        return Err((
+            StatusCode::CONFLICT,
+            "Transfer group ownership before leaving".to_string(),
+        ));
+    }
+
+    let deleted = diesel::delete(
+        conversation_members::table
+            .filter(conversation_members::conversation_id.eq(group_id))
+            .filter(conversation_members::user_id.eq(user_id)),
+    )
+    .execute(&mut conn)
+    .await
+    .map_err(internal_error)?;
+    if deleted == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Group membership not found".to_string(),
+        ));
+    }
+    touch_group(&mut conn, group_id).await?;
+    publish_group_update(&state, &mut conn, group_id, &[user_id]).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn hide_direct_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<Uuid>,
+) -> EmptyResult {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let conversation: Conversation = conversations::table
+        .find(conversation_id)
+        .select(Conversation::as_select())
+        .first(&mut conn)
+        .await
+        .optional()
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+
+    if conversation.kind != "direct"
+        || (conversation.direct_user_low_id != Some(user_id)
+            && conversation.direct_user_high_id != Some(user_id))
+    {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+
+    diesel::insert_into(conversation_hidden_states::table)
+        .values((
+            conversation_hidden_states::conversation_id.eq(conversation_id),
+            conversation_hidden_states::user_id.eq(user_id),
+        ))
+        .on_conflict((
+            conversation_hidden_states::conversation_id,
+            conversation_hidden_states::user_id,
+        ))
+        .do_nothing()
+        .execute(&mut conn)
+        .await
+        .map_err(internal_error)?;
+    state
+        .social_events
+        .publish([user_id], SocialResource::Conversations);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -464,6 +560,7 @@ async fn update_group_member_role(
         return Err((StatusCode::NOT_FOUND, "Group member not found".to_string()));
     }
     touch_group(&mut conn, group_id).await?;
+    publish_group_update(&state, &mut conn, group_id, &[]).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -483,6 +580,17 @@ async fn open_direct_conversation(
     ensure_user_exists(&mut conn, target_id).await?;
 
     if let Some(conversation) = find_direct_conversation(&mut conn, user_id, target_id).await? {
+        diesel::delete(
+            conversation_hidden_states::table
+                .filter(conversation_hidden_states::conversation_id.eq(conversation.id))
+                .filter(conversation_hidden_states::user_id.eq(user_id)),
+        )
+        .execute(&mut conn)
+        .await
+        .map_err(internal_error)?;
+        state
+            .social_events
+            .publish([user_id], SocialResource::Conversations);
         return Ok(Json(OpenDirectConversationResponse {
             state: "available".to_string(),
             conversation: Some(conversation_response(&conversation, user_id, None)?),
@@ -502,6 +610,17 @@ async fn open_direct_conversation(
             })
             .await
             .map_err(ConversationError::into_api_error)?;
+        diesel::delete(
+            conversation_hidden_states::table
+                .filter(conversation_hidden_states::conversation_id.eq(conversation.id))
+                .filter(conversation_hidden_states::user_id.eq(user_id)),
+        )
+        .execute(&mut conn)
+        .await
+        .map_err(internal_error)?;
+        state
+            .social_events
+            .publish([user_id, target_id], SocialResource::Conversations);
         return Ok(Json(OpenDirectConversationResponse {
             state: "available".to_string(),
             conversation: Some(conversation_response(&conversation, user_id, None)?),
@@ -533,6 +652,9 @@ async fn open_direct_conversation(
         }
         if request.status == "accepted" {
             let conversation = ensure_direct_conversation(&mut conn, user_id, target_id).await?;
+            state
+                .social_events
+                .publish([user_id, target_id], SocialResource::Conversations);
             return Ok(Json(OpenDirectConversationResponse {
                 state: "available".to_string(),
                 conversation: Some(conversation_response(&conversation, user_id, None)?),
@@ -563,6 +685,10 @@ async fn open_direct_conversation(
             ),
             _ => internal_error(error),
         })?;
+
+    state
+        .social_events
+        .publish([target_id], SocialResource::Conversations);
 
     Ok(Json(OpenDirectConversationResponse {
         state: "pending".to_string(),
@@ -650,6 +776,11 @@ async fn respond_to_direct_message_request(
         })
         .await
         .map_err(ConversationError::into_api_error)?;
+
+    state.social_events.publish(
+        [direct_request.requester_id, direct_request.recipient_id],
+        SocialResource::Conversations,
+    );
 
     if !request.accept {
         return Ok(Json(OpenDirectConversationResponse {
@@ -820,6 +951,37 @@ async fn is_friends_with_every_member(
         }
     }
     Ok(true)
+}
+
+async fn group_member_ids(
+    conn: &mut diesel_async::AsyncPgConnection,
+    group_id: Uuid,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    conversation_members::table
+        .filter(conversation_members::conversation_id.eq(group_id))
+        .select(conversation_members::user_id)
+        .load(conn)
+        .await
+        .map_err(internal_error)
+}
+
+async fn publish_group_update(
+    state: &AppState,
+    conn: &mut diesel_async::AsyncPgConnection,
+    group_id: Uuid,
+    additional_recipients: &[Uuid],
+) {
+    match group_member_ids(conn, group_id).await {
+        Ok(mut recipients) => {
+            recipients.extend_from_slice(additional_recipients);
+            state
+                .social_events
+                .publish(recipients, SocialResource::Conversations);
+        }
+        Err((_, error)) => {
+            tracing::warn!(%error, %group_id, "Failed to publish group conversation update");
+        }
+    }
 }
 
 async fn are_accepted_friends(
