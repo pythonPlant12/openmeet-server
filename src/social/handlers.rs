@@ -38,6 +38,7 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 type EmptyResult = Result<StatusCode, (StatusCode, String)>;
 
 const MAX_AVATAR_BYTES: usize = 5 * 1024 * 1024;
+const MAX_AVATAR_UPLOAD_BYTES: usize = MAX_AVATAR_BYTES + 1024 * 1024;
 
 pub fn social_routes() -> Router<AppState> {
     Router::new()
@@ -53,7 +54,7 @@ pub fn social_routes() -> Router<AppState> {
         )
         .route(
             "/me/profile/avatar",
-            post(upload_avatar).layer(DefaultBodyLimit::max(MAX_AVATAR_BYTES)),
+            post(upload_avatar).layer(DefaultBodyLimit::max(MAX_AVATAR_UPLOAD_BYTES)),
         )
         .route("/presence", post(update_presence))
         .route("/events", get(crate::social::social_events_handler))
@@ -273,7 +274,7 @@ pub async fn upload_avatar(
             "Avatar must be a JPEG, PNG, WebP, or GIF image".to_string(),
         ))?;
         let bytes = field.bytes().await.map_err(multipart_error)?;
-        if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES {
+        if !valid_avatar_size(bytes.len()) {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Avatar must be between 1 byte and 5 MiB".to_string(),
@@ -1162,6 +1163,10 @@ fn has_image_signature(content_type: &str, bytes: &[u8]) -> bool {
     }
 }
 
+fn valid_avatar_size(size: usize) -> bool {
+    (1..=MAX_AVATAR_BYTES).contains(&size)
+}
+
 fn image_media_type(content_type: &str) -> String {
     content_type
         .split(';')
@@ -1242,8 +1247,9 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        avatar_extension, has_image_signature, is_valid_room_id, normalize_name,
-        normalize_nickname, normalize_status_message, validated_user_search_query,
+        MAX_AVATAR_BYTES, avatar_extension, has_image_signature, is_valid_room_id, normalize_name,
+        normalize_nickname, normalize_status_message, valid_avatar_size,
+        validated_user_search_query,
     };
 
     #[test]
@@ -1280,6 +1286,14 @@ mod tests {
         assert_eq!(avatar_extension("image/png"), Some("png"));
         assert_eq!(avatar_extension("image/svg+xml"), None);
         assert_eq!(avatar_extension("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn accepts_avatar_files_through_five_mebibytes() {
+        assert!(valid_avatar_size(1));
+        assert!(valid_avatar_size(MAX_AVATAR_BYTES));
+        assert!(!valid_avatar_size(0));
+        assert!(!valid_avatar_size(MAX_AVATAR_BYTES + 1));
     }
 
     #[test]
