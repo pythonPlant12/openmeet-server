@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::schema::{
     call_invitations, call_session_members, call_sessions, conversation_members,
     conversation_messages, conversations, direct_message_requests, friendships, meeting_history,
-    notifications, user_presence, users,
+    notifications, revoked_sfu_rooms, user_presence, users,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -65,6 +65,8 @@ pub struct Conversation {
     pub password_hash: Option<String>,
     pub direct_user_low_id: Option<Uuid>,
     pub direct_user_high_id: Option<Uuid>,
+    pub group_code: Option<String>,
+    pub avatar_key: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -79,6 +81,8 @@ pub struct NewConversation {
     pub password_hash: Option<String>,
     pub direct_user_low_id: Option<Uuid>,
     pub direct_user_high_id: Option<Uuid>,
+    pub group_code: Option<String>,
+    pub avatar_key: Option<String>,
 }
 
 #[derive(Debug, Queryable, Selectable)]
@@ -159,6 +163,12 @@ pub struct NewCallSessionMember {
     pub user_id: Uuid,
     pub status: String,
     pub responded_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = revoked_sfu_rooms)]
+pub struct NewRevokedSfuRoom<'a> {
+    pub sfu_room_id: &'a str,
 }
 
 #[derive(Debug, Queryable, Selectable)]
@@ -312,6 +322,16 @@ pub struct CreateGroupRequest {
     pub title: String,
     pub access_policy: GroupAccessPolicy,
     pub password: Option<String>,
+    #[serde(default)]
+    pub member_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGroupRequest {
+    pub title: Option<String>,
+    pub access_policy: Option<GroupAccessPolicy>,
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +350,19 @@ pub struct AddConversationMemberRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinGroupRequest {
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupCodeInfoRequest {
+    pub group_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoinGroupByCodeRequest {
+    pub group_code: String,
     pub password: Option<String>,
 }
 
@@ -531,6 +564,8 @@ pub struct ConversationResponse {
     pub kind: ConversationKind,
     pub title: Option<String>,
     pub access_policy: Option<GroupAccessPolicy>,
+    pub group_code: Option<String>,
+    pub avatar_url: Option<String>,
     pub role: Option<String>,
     pub other_user_id: Option<Uuid>,
     pub message_count: i64,
@@ -544,11 +579,14 @@ pub struct ConversationResponse {
 pub struct GroupInfoResponse {
     pub id: Uuid,
     pub title: String,
+    pub group_code: String,
+    pub avatar_url: Option<String>,
     pub access_policy: GroupAccessPolicy,
     pub member_count: i64,
     pub is_member: bool,
     pub role: Option<String>,
     pub can_join: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -596,7 +634,42 @@ pub struct DirectMessageRequestResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::UserStatus;
+    use super::{CreateGroupRequest, GroupCodeInfoRequest, JoinGroupByCodeRequest, UserStatus};
+
+    #[test]
+    fn defaults_initial_group_members_to_empty() {
+        let request: CreateGroupRequest = serde_json::from_value(serde_json::json!({
+            "title": "Harbor",
+            "accessPolicy": "open",
+            "password": null
+        }))
+        .unwrap();
+
+        assert!(request.member_ids.is_empty());
+    }
+
+    #[test]
+    fn deserializes_group_code_requests_from_json_bodies() {
+        let info: GroupCodeInfoRequest = serde_json::from_value(serde_json::json!({
+            "groupCode": "calm-harbor-123abc"
+        }))
+        .unwrap();
+        let join: JoinGroupByCodeRequest = serde_json::from_value(serde_json::json!({
+            "groupCode": "calm-harbor-123abc",
+            "password": "secret-password"
+        }))
+        .unwrap();
+
+        assert_eq!(info.group_code, "calm-harbor-123abc");
+        assert_eq!(join.group_code, "calm-harbor-123abc");
+        assert_eq!(join.password.as_deref(), Some("secret-password"));
+        assert!(
+            serde_json::from_value::<GroupCodeInfoRequest>(serde_json::json!({
+                "group_code": "calm-harbor-123abc"
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn validates_persisted_user_statuses() {

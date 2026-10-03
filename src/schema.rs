@@ -92,6 +92,10 @@ diesel::table! {
         password_hash -> Nullable<Varchar>,
         direct_user_low_id -> Nullable<Uuid>,
         direct_user_high_id -> Nullable<Uuid>,
+        #[max_length = 80]
+        group_code -> Nullable<Varchar>,
+        #[max_length = 512]
+        avatar_key -> Nullable<Varchar>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -181,6 +185,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    revoked_sfu_rooms (sfu_room_id) {
+        #[max_length = 128]
+        sfu_room_id -> Varchar,
+        revoked_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     user_presence (user_id) {
         user_id -> Uuid,
         last_seen_at -> Timestamptz,
@@ -213,6 +225,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     meeting_history,
     notifications,
     refresh_tokens,
+    revoked_sfu_rooms,
     user_presence,
     users,
 );
