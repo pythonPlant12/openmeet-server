@@ -407,8 +407,12 @@ async fn handle_message(
 
             // Call-session rooms require an accepted authenticated member. This runs before
             // touching in-memory room state, so denied joins cannot allocate SFU resources.
-            match authorize_sfu_room(pool, &room_id, session_user_id).await {
-                Ok(SfuRoomAuthorization::Legacy | SfuRoomAuthorization::Authorized) => {}
+            let room_authorization = match authorize_sfu_room(pool, &room_id, session_user_id).await
+            {
+                Ok(
+                    authorization @ (SfuRoomAuthorization::Legacy
+                    | SfuRoomAuthorization::Authorized),
+                ) => authorization,
                 Ok(SfuRoomAuthorization::Denied) => {
                     let _ = tx.send(SignalingMessage::Error {
                         message: "Call session access denied".to_string(),
@@ -425,7 +429,7 @@ async fn handle_message(
                     });
                     return;
                 }
-            }
+            };
 
             info!(
                 "Participant {} ({}) joining room {}",
@@ -448,7 +452,42 @@ async fn handle_message(
 
             // Get the room
             if let Some(room_lock) = room_repo.get_room(&room_id).await {
+                // Recheck managed rooms immediately before taking the room lock. The later
+                // shared denial marker closes races during peer setup without another DB await.
+                if room_authorization == SfuRoomAuthorization::Authorized {
+                    match authorize_sfu_room(pool, &room_id, session_user_id).await {
+                        Ok(SfuRoomAuthorization::Authorized) => {}
+                        Ok(SfuRoomAuthorization::Legacy | SfuRoomAuthorization::Denied) => {
+                            let _ = tx.send(SignalingMessage::Error {
+                                message: "Call session access denied".to_string(),
+                            });
+                            return;
+                        }
+                        Err(error) => {
+                            error!(
+                                "Failed to reauthorize call-session room {}: {}",
+                                room_id, error
+                            );
+                            let _ = tx.send(SignalingMessage::Error {
+                                message: "Unable to authorize call session".to_string(),
+                            });
+                            return;
+                        }
+                    }
+                }
+
                 let mut room = room_lock.write().await;
+
+                // Group deletion and member removal may commit after SQL authorization. Their
+                // shared markers make this final check synchronous and race-safe.
+                if room.is_revoked()
+                    || session_user_id.is_some_and(|user_id| room.is_user_denied(user_id))
+                {
+                    let _ = tx.send(SignalingMessage::Error {
+                        message: "Call session access denied".to_string(),
+                    });
+                    return;
+                }
 
                 // Get list of existing participants before adding new one (including media states)
                 let existing_participants = room.get_participants_with_media_state();
@@ -632,6 +671,7 @@ async fn handle_message(
                         // Set up track handler to forward media to other participants
                         let room_lock_clone = Arc::clone(&room_lock);
                         let participant_id_clone = participant_id.to_string();
+                        let session_user_id_for_track = session_user_id;
 
                         {
                             let pc = peer_conn.lock().await;
@@ -646,6 +686,12 @@ async fn handle_message(
                                 tokio::spawn(async move {
                                     if let Some(room_lock) = Some(room_lock) {
                                         let mut room = room_lock.write().await;
+                                        if !room.has_active_participant(
+                                            &participant_id,
+                                            session_user_id_for_track,
+                                        ) {
+                                            return;
+                                        }
                                         room.handle_incoming_track(
                                             &participant_id,
                                             track,
@@ -673,6 +719,26 @@ async fn handle_message(
                         });
                         return;
                     }
+                }
+
+                // A membership removal can mark denial while peer setup holds the room lock.
+                // Check shared access markers again before exposing this participant to the room.
+                if room.is_revoked()
+                    || session_user_id.is_some_and(|user_id| room.is_user_denied(user_id))
+                {
+                    if let Some(peer_conn) = participant_conn.get_peer_connection() {
+                        let peer_conn = peer_conn.lock().await;
+                        if let Err(error) = peer_conn.close().await {
+                            warn!(
+                                "Failed to close denied peer connection for {}: {}",
+                                participant_id, error
+                            );
+                        }
+                    }
+                    let _ = tx.send(SignalingMessage::Error {
+                        message: "Call session access denied".to_string(),
+                    });
+                    return;
                 }
 
                 room.add_participant(participant_conn);
@@ -738,6 +804,10 @@ async fn handle_message(
                 if let Some(room_lock) = room_repo.get_room(room_id).await {
                     let room = room_lock.read().await;
 
+                    if !room.has_active_participant(participant_id, session_user_id) {
+                        return;
+                    }
+
                     // Get this participant's peer connection
                     if let Some(participant_conn) = room.participants.get(participant_id) {
                         if let Some(peer_conn) = participant_conn.get_peer_connection() {
@@ -800,6 +870,8 @@ async fn handle_message(
                                                     Arc::clone(&room.pending_negotiated_tracks);
                                                 let forwarded_tracks_ref =
                                                     Arc::clone(&room.forwarded_tracks);
+                                                let room_lock_for_renego = Arc::clone(&room_lock);
+                                                let session_user_id_for_renego = session_user_id;
 
                                                 // Get the late joiner's shutdown receiver - used to stop writer tasks when they disconnect
                                                 let shutdown_rx_for_late_joiner =
@@ -827,6 +899,17 @@ async fn handle_message(
                                                 );
 
                                                 tokio::spawn(async move {
+                                                    {
+                                                        let room =
+                                                            room_lock_for_renego.read().await;
+                                                        if !room.has_active_participant(
+                                                            &participant_id_for_renego,
+                                                            session_user_id_for_renego,
+                                                        ) {
+                                                            return;
+                                                        }
+                                                    }
+
                                                     let peer_conn_lock =
                                                         peer_conn_for_renego.lock().await;
                                                     let pc = peer_conn_lock.get_peer_connection();
@@ -1018,6 +1101,17 @@ async fn handle_message(
 
                                                     match offer_result {
                                                         Some(Ok(offer)) => {
+                                                            {
+                                                                let room = room_lock_for_renego
+                                                                    .read()
+                                                                    .await;
+                                                                if !room.has_active_participant(
+                                                                    &participant_id_for_renego,
+                                                                    session_user_id_for_renego,
+                                                                ) {
+                                                                    return;
+                                                                }
+                                                            }
                                                             info!(
                                                                 "Sending renegotiation offer to {} with {} tracks",
                                                                 participant_id_for_renego,
@@ -1165,6 +1259,10 @@ async fn handle_message(
                 if let Some(room_lock) = room_repo.get_room(room_id).await {
                     let room = room_lock.read().await;
 
+                    if !room.has_active_participant(participant_id, session_user_id) {
+                        return;
+                    }
+
                     if let Some(participant_conn) = room.participants.get(participant_id) {
                         if let Some(peer_conn) = participant_conn.get_peer_connection() {
                             let peer_conn_lock = peer_conn.lock().await;
@@ -1179,12 +1277,19 @@ async fn handle_message(
                                     let peer_conn_for_retry = Arc::clone(&peer_conn);
                                     let tx_for_retry = tx.clone();
                                     let room_lock_for_retry = Arc::clone(&room_lock);
+                                    let session_user_id_for_retry = session_user_id;
 
                                     tokio::spawn(async move {
                                         tokio::time::sleep(std::time::Duration::from_millis(100))
                                             .await;
 
                                         let room = room_lock_for_retry.read().await;
+                                        if !room.has_active_participant(
+                                            &participant_id_for_retry,
+                                            session_user_id_for_retry,
+                                        ) {
+                                            return;
+                                        }
                                         let peer_conn_lock = peer_conn_for_retry.lock().await;
 
                                         // Promote tracks from the answered server offer into the negotiated set.
@@ -1351,6 +1456,10 @@ async fn handle_message(
                 if let Some(room_lock) = room_repo.get_room(room_id).await {
                     let room = room_lock.read().await;
 
+                    if !room.has_active_participant(participant_id, session_user_id) {
+                        return;
+                    }
+
                     // Get this participant's peer connection
                     if let Some(participant_conn) = room.participants.get(participant_id) {
                         if let Some(peer_conn) = participant_conn.get_peer_connection() {
@@ -1400,6 +1509,10 @@ async fn handle_message(
                 if let Some(room_lock) = room_repo.get_room(room_id).await {
                     let mut room = room_lock.write().await;
 
+                    if !room.has_active_participant(participant_id, session_user_id) {
+                        return;
+                    }
+
                     // Update the participant's stored media state
                     if let Some(participant_conn) = room.participants.get_mut(participant_id) {
                         participant_conn.participant.audio_enabled = audio_enabled;
@@ -1430,6 +1543,11 @@ async fn handle_message(
         } => {
             if let Some(room_id) = current_room_id {
                 if let Some(room_lock) = room_repo.get_room(room_id).await {
+                    let mut room = room_lock.write().await;
+                    if !room.has_active_participant(participant_id, session_user_id) {
+                        return;
+                    }
+
                     let now = Instant::now();
                     while recent_chat_messages
                         .front()
@@ -1449,7 +1567,6 @@ async fn handle_message(
                     }
                     recent_chat_messages.push_back(now);
 
-                    let mut room = room_lock.write().await;
                     if !room.allow_chat_message() {
                         warn!("Rate-limited chat messages in room {}", room_id);
                         return;
