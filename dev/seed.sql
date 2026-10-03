@@ -144,7 +144,7 @@ INSERT INTO conversations (id, kind, creator_id, title, access_policy, password_
 VALUES
     ('23000000-0000-0000-0000-000000000001', 'group', '00000000-0000-0000-0000-000000000007', 'Numbered crew', 'open', NULL, 'numbered-crew'),
     ('23000000-0000-0000-0000-000000000002', 'group', '00000000-0000-0000-0000-000000000009', 'Design sync', 'friends_only', NULL, 'design-sync'),
-    ('23000000-0000-0000-0000-000000000003', 'group', '00000000-0000-0000-0000-000000000011', 'Private test room', 'password', '$argon2id$v=19$m=19456,t=2,p=1$LyWo1S0LPwugujOGwk+CLA$rf5jmTmcRETEKncXib2wTvU72phjkmJZEt6vku5wXlk', 'private-test-room'),
+    ('23000000-0000-0000-0000-000000000003', 'group', '00000000-0000-0000-0000-000000000011', 'Members room', 'friends_only', NULL, 'members-room'),
     ('23000000-0000-0000-0000-000000000004', 'group', '00000000-0000-0000-0000-000000000016', 'Pair lab', 'open', NULL, 'pair-lab')
 ON CONFLICT (id) DO NOTHING;
 
