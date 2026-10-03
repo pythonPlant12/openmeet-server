@@ -298,10 +298,10 @@ fn validate_message_page(
         ));
     }
     let limit = query.limit.unwrap_or(50);
-    if !(1..=100).contains(&limit) {
+    if !(1..=50).contains(&limit) {
         return Err((
             StatusCode::BAD_REQUEST,
-            "limit must be between 1 and 100".to_string(),
+            "limit must be between 1 and 50".to_string(),
         ));
     }
     Ok((query.before, limit))
@@ -359,10 +359,10 @@ mod tests {
         assert_eq!(
             validate_message_page(ListConversationMessagesQuery {
                 before: None,
-                limit: Some(100),
+                limit: Some(50),
             })
             .unwrap(),
-            (None, 100)
+            (None, 50)
         );
         assert!(
             validate_message_page(ListConversationMessagesQuery {
@@ -381,7 +381,7 @@ mod tests {
         assert!(
             validate_message_page(ListConversationMessagesQuery {
                 before: None,
-                limit: Some(101),
+                limit: Some(51),
             })
             .is_err()
         );
