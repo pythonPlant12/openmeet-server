@@ -2,12 +2,16 @@ use crate::sfu::packet_buffer::RtpPacketBuffer;
 use crate::sfu::participant::ParticipantConnection;
 use crate::signaling::message::{ChatMessagePayload, SignalingMessage};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{
+    Arc, RwLock as StdRwLock,
+    atomic::{AtomicBool, Ordering},
+};
 use sysinfo::{Pid, System};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
@@ -62,6 +66,8 @@ impl Drop for SenderTrackInfo {
 pub struct Room {
     pub id: String,
     pub participants: HashMap<String, ParticipantConnection>,
+    revoked: Arc<AtomicBool>,
+    denied_user_ids: Arc<StdRwLock<HashSet<Uuid>>>,
     /// Tracks being sent by each participant (participant_id -> list of track info)
     pub participant_tracks: HashMap<String, Vec<SenderTrackInfo>>,
     /// Track IDs that have been successfully negotiated to each participant.
@@ -83,6 +89,8 @@ impl Room {
         Self {
             id,
             participants: HashMap::new(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            denied_user_ids: Arc::new(StdRwLock::new(HashSet::new())),
             participant_tracks: HashMap::new(),
             negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
             pending_negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
@@ -90,6 +98,38 @@ impl Room {
             chat_history: VecDeque::with_capacity(CHAT_HISTORY_CAPACITY),
             recent_chat_messages: VecDeque::with_capacity(ROOM_CHAT_RATE_LIMIT),
         }
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn revocation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.revoked)
+    }
+
+    pub(crate) fn denied_user_ids(&self) -> Arc<StdRwLock<HashSet<Uuid>>> {
+        Arc::clone(&self.denied_user_ids)
+    }
+
+    pub fn deny_user(&self, user_id: Uuid) {
+        self.denied_user_ids
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(user_id);
+    }
+
+    pub fn is_user_denied(&self, user_id: Uuid) -> bool {
+        self.denied_user_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&user_id)
+    }
+
+    pub fn has_active_participant(&self, participant_id: &str, user_id: Option<Uuid>) -> bool {
+        !self.is_revoked()
+            && !user_id.is_some_and(|user_id| self.is_user_denied(user_id))
+            && self.participants.contains_key(participant_id)
     }
 
     /// Add a participant to the room
@@ -1072,6 +1112,8 @@ impl Room {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sfu::participant::Participant;
+    use tokio::sync::mpsc;
 
     #[test]
     fn chat_history_keeps_latest_messages_in_order() {
@@ -1103,5 +1145,35 @@ mod tests {
             assert!(room.allow_chat_message());
         }
         assert!(!room.allow_chat_message());
+    }
+
+    #[test]
+    fn denied_users_are_recorded_per_room() {
+        let room = Room::new("room-1".to_string());
+        let other_room = Room::new("room-2".to_string());
+        let denied_user_id = Uuid::new_v4();
+        let other_user_id = Uuid::new_v4();
+
+        assert!(!room.is_user_denied(denied_user_id));
+        room.deny_user(denied_user_id);
+
+        assert!(room.is_user_denied(denied_user_id));
+        assert!(!room.is_user_denied(other_user_id));
+        assert!(!other_room.is_user_denied(denied_user_id));
+    }
+
+    #[test]
+    fn denied_user_is_not_an_active_participant() {
+        let mut room = Room::new("room-1".to_string());
+        let user_id = Uuid::new_v4();
+        let participant_id = "participant-1";
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut participant = Participant::new(participant_id.to_string(), "Alice".to_string());
+        participant.user_id = Some(user_id);
+        room.add_participant(ParticipantConnection::new(participant, tx));
+
+        assert!(room.has_active_participant(participant_id, Some(user_id)));
+        room.deny_user(user_id);
+        assert!(!room.has_active_participant(participant_id, Some(user_id)));
     }
 }
