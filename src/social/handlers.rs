@@ -38,7 +38,13 @@ type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 type EmptyResult = Result<StatusCode, (StatusCode, String)>;
 
 const MAX_AVATAR_BYTES: usize = 5 * 1024 * 1024;
-const MAX_AVATAR_UPLOAD_BYTES: usize = MAX_AVATAR_BYTES + 1024 * 1024;
+pub(super) const MAX_AVATAR_UPLOAD_BYTES: usize = MAX_AVATAR_BYTES + 1024 * 1024;
+
+pub(super) struct AvatarUpload {
+    pub content_type: String,
+    pub extension: &'static str,
+    pub bytes: Vec<u8>,
+}
 
 pub fn social_routes() -> Router<AppState> {
     Router::new()
@@ -253,48 +259,10 @@ pub async fn update_self_profile(
 pub async fn upload_avatar(
     State(state): State<AppState>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> ApiResult<UserProfile> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
-    let mut avatar = None;
-
-    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
-        if field.name() != Some("avatar") || avatar.is_some() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Submit exactly one avatar file".to_string(),
-            ));
-        }
-        let content_type = field.content_type().map(str::to_owned).ok_or((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Avatar content type is required".to_string(),
-        ))?;
-        let extension = avatar_extension(&content_type).ok_or((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Avatar must be a JPEG, PNG, WebP, or GIF image".to_string(),
-        ))?;
-        let bytes = field.bytes().await.map_err(multipart_error)?;
-        if !valid_avatar_size(bytes.len()) {
-            return Err((
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Avatar must be between 1 byte and 5 MiB".to_string(),
-            ));
-        }
-        if !has_image_signature(&content_type, &bytes) {
-            return Err((
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "Avatar contents do not match its image type".to_string(),
-            ));
-        }
-        avatar = Some((content_type, extension, bytes.to_vec()));
-    }
-
-    let Some((content_type, extension, bytes)) = avatar else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Avatar file is required".to_string(),
-        ));
-    };
+    let avatar = parse_avatar_upload(multipart).await?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
     let previous_avatar_key = users::table
         .filter(users::id.eq(user_id))
@@ -302,10 +270,10 @@ pub async fn upload_avatar(
         .first::<Option<String>>(&mut conn)
         .await
         .map_err(user_not_found)?;
-    let key = format!("avatars/{user_id}/{}.{}", Uuid::new_v4(), extension);
+    let key = format!("avatars/{user_id}/{}.{}", Uuid::new_v4(), avatar.extension);
     state
         .avatar_storage
-        .upload(&key, &content_type, bytes)
+        .upload(&key, &avatar.content_type, avatar.bytes)
         .await
         .map_err(storage_error)?;
 
@@ -1176,6 +1144,52 @@ fn image_media_type(content_type: &str) -> String {
         .to_ascii_lowercase()
 }
 
+pub(super) async fn parse_avatar_upload(
+    mut multipart: Multipart,
+) -> Result<AvatarUpload, (StatusCode, String)> {
+    let mut avatar = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
+        if field.name() != Some("avatar") || avatar.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Submit exactly one avatar file".to_string(),
+            ));
+        }
+        let content_type = field.content_type().map(str::to_owned).ok_or((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Avatar content type is required".to_string(),
+        ))?;
+        let extension = avatar_extension(&content_type).ok_or((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Avatar must be a JPEG, PNG, WebP, or GIF image".to_string(),
+        ))?;
+        let bytes = field.bytes().await.map_err(multipart_error)?;
+        if !valid_avatar_size(bytes.len()) {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Avatar must be between 1 byte and 5 MiB".to_string(),
+            ));
+        }
+        if !has_image_signature(&content_type, &bytes) {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Avatar contents do not match its image type".to_string(),
+            ));
+        }
+        avatar = Some(AvatarUpload {
+            content_type,
+            extension,
+            bytes: bytes.to_vec(),
+        });
+    }
+
+    avatar.ok_or((
+        StatusCode::BAD_REQUEST,
+        "Avatar file is required".to_string(),
+    ))
+}
+
 async fn authorize_profile_access(
     conn: &mut diesel_async::AsyncPgConnection,
     requester_id: Uuid,
@@ -1216,7 +1230,7 @@ fn multipart_error(error: axum::extract::multipart::MultipartError) -> (StatusCo
     (StatusCode::BAD_REQUEST, "Invalid avatar upload".to_string())
 }
 
-fn storage_error(error: anyhow::Error) -> (StatusCode, String) {
+pub(super) fn storage_error(error: anyhow::Error) -> (StatusCode, String) {
     tracing::error!(%error, "Avatar storage error");
     (
         StatusCode::SERVICE_UNAVAILABLE,

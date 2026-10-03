@@ -6,7 +6,12 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Duration, Utc};
-use diesel::prelude::*;
+use diesel::{
+    deserialize::QueryableByName,
+    prelude::*,
+    sql_query,
+    sql_types::{Bool, Nullable, Text, Uuid as SqlUuid},
+};
 use diesel_async::{
     AsyncConnection, AsyncPgConnection, RunQueryDsl, scoped_futures::ScopedFutureExt,
 };
@@ -36,6 +41,16 @@ pub enum SfuRoomAuthorization {
     Legacy,
     Authorized,
     Denied,
+}
+
+#[derive(QueryableByName)]
+struct SfuRoomAuthorizationSnapshot {
+    #[diesel(sql_type = Bool)]
+    is_revoked: bool,
+    #[diesel(sql_type = Bool)]
+    is_call_session_room: bool,
+    #[diesel(sql_type = Bool)]
+    is_authorized: bool,
 }
 
 #[derive(Debug)]
@@ -313,49 +328,73 @@ pub async fn authorize_sfu_room(
     sfu_room_id: &str,
     user_id: Option<Uuid>,
 ) -> Result<SfuRoomAuthorization> {
-    let now = Utc::now();
     let mut conn = pool.get().await?;
-    expire_call_sessions(&mut conn, now).await?;
+    let snapshot: SfuRoomAuthorizationSnapshot = sql_query(
+        "SELECT
+            EXISTS (
+                SELECT 1
+                FROM revoked_sfu_rooms AS revoked
+                WHERE revoked.sfu_room_id = $1
+            ) AS is_revoked,
+            EXISTS (
+                SELECT 1
+                FROM call_sessions AS session
+                WHERE session.sfu_room_id = $1
+            ) AS is_call_session_room,
+            CASE WHEN $2::uuid IS NULL THEN FALSE ELSE EXISTS (
+                SELECT 1
+                FROM call_sessions AS session
+                INNER JOIN call_session_members AS member
+                    ON member.call_session_id = session.id
+                INNER JOIN conversations AS conversation
+                    ON conversation.id = session.conversation_id
+                WHERE session.sfu_room_id = $1
+                  AND session.status = 'active'
+                  AND session.expires_at > NOW()
+                  AND member.user_id = $2
+                  AND member.status = 'accepted'
+                  AND (
+                    (
+                        conversation.kind = 'direct'
+                        AND $2 IN (
+                            conversation.direct_user_low_id,
+                            conversation.direct_user_high_id
+                        )
+                    )
+                    OR (
+                        conversation.kind = 'group'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM conversation_members AS current_member
+                            WHERE current_member.conversation_id = conversation.id
+                              AND current_member.user_id = $2
+                        )
+                    )
+                  )
+            ) END AS is_authorized",
+    )
+    .bind::<Text, _>(sfu_room_id)
+    .bind::<Nullable<SqlUuid>, _>(user_id)
+    .get_result(&mut conn)
+    .await?;
 
-    let is_call_session_room = call_sessions::table
-        .filter(call_sessions::sfu_room_id.eq(sfu_room_id))
-        .select(call_sessions::id)
-        .first::<Uuid>(&mut conn)
-        .await
-        .optional()?
-        .is_some();
-    if !is_call_session_room {
-        return Ok(classify_sfu_room_authorization(false, user_id, false));
-    }
-
-    let Some(user_id) = user_id else {
-        return Ok(classify_sfu_room_authorization(true, None, false));
-    };
-    let authorized = call_session_members::table
-        .inner_join(call_sessions::table)
-        .filter(call_session_members::user_id.eq(user_id))
-        .filter(call_session_members::status.eq("accepted"))
-        .filter(call_sessions::sfu_room_id.eq(sfu_room_id))
-        .filter(call_sessions::status.eq("active"))
-        .filter(call_sessions::expires_at.gt(now))
-        .select(call_session_members::user_id)
-        .first::<Uuid>(&mut conn)
-        .await
-        .optional()?
-        .is_some();
     Ok(classify_sfu_room_authorization(
-        true,
-        Some(user_id),
-        authorized,
+        snapshot.is_revoked,
+        snapshot.is_call_session_room,
+        user_id,
+        snapshot.is_authorized,
     ))
 }
 
 fn classify_sfu_room_authorization(
+    is_revoked: bool,
     is_call_session_room: bool,
     user_id: Option<Uuid>,
     has_accepted_membership: bool,
 ) -> SfuRoomAuthorization {
-    if !is_call_session_room {
+    if is_revoked {
+        SfuRoomAuthorization::Denied
+    } else if !is_call_session_room {
         SfuRoomAuthorization::Legacy
     } else if user_id.is_some() && has_accepted_membership {
         SfuRoomAuthorization::Authorized
@@ -506,20 +545,32 @@ mod tests {
         let user_id = Uuid::new_v4();
 
         assert_eq!(
-            classify_sfu_room_authorization(false, None, false),
+            classify_sfu_room_authorization(false, false, None, false),
             SfuRoomAuthorization::Legacy
         );
         assert_eq!(
-            classify_sfu_room_authorization(true, None, false),
+            classify_sfu_room_authorization(false, true, None, false),
             SfuRoomAuthorization::Denied
         );
         assert_eq!(
-            classify_sfu_room_authorization(true, Some(user_id), false),
+            classify_sfu_room_authorization(false, true, Some(user_id), false),
             SfuRoomAuthorization::Denied
         );
         assert_eq!(
-            classify_sfu_room_authorization(true, Some(user_id), true),
+            classify_sfu_room_authorization(false, true, Some(user_id), true),
             SfuRoomAuthorization::Authorized
+        );
+    }
+
+    #[test]
+    fn revoked_room_is_denied_before_legacy_classification() {
+        assert_eq!(
+            classify_sfu_room_authorization(true, false, Some(Uuid::new_v4()), false),
+            SfuRoomAuthorization::Denied
+        );
+        assert_eq!(
+            classify_sfu_room_authorization(true, true, Some(Uuid::new_v4()), true),
+            SfuRoomAuthorization::Denied
         );
     }
 }
