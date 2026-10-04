@@ -19,10 +19,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::{extract_user_id, models::User},
-    schema::{
-        call_invitations, conversation_members, friendships, meeting_history, notifications,
-        user_presence, users,
-    },
+    schema::{call_invitations, friendships, meeting_history, notifications, user_presence, users},
     social::{
         SocialResource,
         avatars::{AvatarQuery, avatar_response, delete_avatar, store_avatar, user_avatar_url},
@@ -31,8 +28,9 @@ use crate::{
             CallInvitation, CallInvitationResponse, CreateCallRequest, CreateFriendRequest,
             FriendRequestItem, FriendSummary, FriendsResponse, Friendship, MeetingHistory,
             MeetingHistoryResponse, NewCallInvitation, NewFriendship, NewMeetingHistory,
-            RecordMeetingRequest, RespondToCallRequest, SearchUsersQuery, UpdateSelfProfileRequest,
-            UserDiscovery, UserPresence, UserProfile, UserStatus,
+            ProfileRelationship, RecordMeetingRequest, RespondToCallRequest, SearchUsersQuery,
+            UpdateSelfProfileRequest, UserDiscovery, UserDiscoveryResponse, UserPresence,
+            UserProfile, UserStatus,
         },
         notification_routes,
         presence::{self, Relationship},
@@ -89,7 +87,7 @@ pub async fn search_users(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<SearchUsersQuery>,
-) -> ApiResult<Vec<UserDiscovery>> {
+) -> ApiResult<Vec<UserDiscoveryResponse>> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let query = validated_user_search_query(&query.query).ok_or((
         StatusCode::BAD_REQUEST,
@@ -100,15 +98,33 @@ pub async fn search_users(
 
     let users: Vec<UserDiscovery> = users::table
         .filter(users::id.ne(user_id))
-        .filter(users::name.ilike(&pattern).or(users::email.ilike(&pattern)))
-        .order((users::name.asc(), users::email.asc()))
+        .filter(
+            users::name
+                .ilike(&pattern)
+                .or(users::nickname.ilike(&pattern))
+                .or(users::email.ilike(&pattern)),
+        )
+        .order((users::name.asc(), users::nickname.asc()))
         .limit(10)
         .select(UserDiscovery::as_select())
         .load(&mut conn)
         .await
         .map_err(internal_error)?;
 
-    Ok(Json(users))
+    Ok(Json(
+        users
+            .into_iter()
+            .map(|user| UserDiscoveryResponse {
+                avatar_url: user
+                    .avatar_key
+                    .as_deref()
+                    .map(|key| user_avatar_url(user.id, key)),
+                id: user.id,
+                name: user.name,
+                nickname: user.nickname,
+            })
+            .collect(),
+    ))
 }
 
 pub async fn get_user_profile(
@@ -118,8 +134,6 @@ pub async fn get_user_profile(
 ) -> ApiResult<UserProfile> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-
-    authorize_profile_access(&mut conn, user_id, target_user_id).await?;
 
     let user: User = users::table
         .filter(users::id.eq(target_user_id))
@@ -132,20 +146,19 @@ pub async fn get_user_profile(
             }
             _ => internal_error(error),
         })?;
-    // Profiles are limited to friends and the user themselves; hidden presence also hides last seen.
-    let relationship = Relationship {
-        is_self: user_id == target_user_id,
-        ..Relationship::FRIEND
+    let relationship = if user_id == target_user_id {
+        ProfileRelationship::Owner
+    } else if are_friends(&mut conn, user_id, target_user_id).await? {
+        ProfileRelationship::Friend
+    } else {
+        ProfileRelationship::None
     };
-    let last_seen_at = user_presence::table
-        .filter(user_presence::user_id.eq(target_user_id))
-        .select(user_presence::last_seen_at)
-        .first::<DateTime<Utc>>(&mut conn)
-        .await
-        .optional()
-        .map_err(internal_error)?
-        .filter(|_| presence::can_see(presence::visibility_for(target_user_id), relationship));
-    Ok(Json(profile_response(user, last_seen_at)?))
+    let last_seen_at = if relationship == ProfileRelationship::None {
+        None
+    } else {
+        last_seen_at(&mut conn, target_user_id).await?
+    };
+    Ok(Json(profile_response(user, last_seen_at, relationship)?))
 }
 
 pub async fn get_user_avatar(
@@ -154,11 +167,9 @@ pub async fn get_user_avatar(
     Path(user_id): Path<Uuid>,
     Query(query): Query<AvatarQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    let requester_id = extract_user_id(&state.jwt, &headers)?;
+    // Avatars are public identity, like the name and nickname that people search already shows.
+    extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    if !shares_group(&mut conn, requester_id, user_id).await? {
-        authorize_profile_access(&mut conn, requester_id, user_id).await?;
-    }
     let avatar_key = users::table
         .filter(users::id.eq(user_id))
         .select(users::avatar_key)
@@ -187,15 +198,13 @@ pub async fn get_self_profile(
         .first(&mut conn)
         .await
         .map_err(user_not_found)?;
-    let last_seen_at = user_presence::table
-        .filter(user_presence::user_id.eq(user_id))
-        .select(user_presence::last_seen_at)
-        .first::<DateTime<Utc>>(&mut conn)
-        .await
-        .optional()
-        .map_err(internal_error)?;
+    let last_seen_at = last_seen_at(&mut conn, user_id).await?;
 
-    Ok(Json(profile_response(user, last_seen_at)?))
+    Ok(Json(profile_response(
+        user,
+        last_seen_at,
+        ProfileRelationship::Owner,
+    )?))
 }
 
 pub async fn update_self_profile(
@@ -258,7 +267,21 @@ pub async fn update_self_profile(
             _ => internal_error(error),
         })?;
 
-    Ok(Json(profile_response(user, None)?))
+    // Friends see this user's name, nickname, and status in their lists, so refresh them.
+    match accepted_friend_ids(&mut conn, user_id).await {
+        Ok(friend_ids) => state
+            .social_events
+            .publish(friend_ids, SocialResource::Friends),
+        Err((_, error)) => {
+            tracing::warn!(%error, %user_id, "Failed to notify friends of profile change")
+        }
+    }
+
+    Ok(Json(profile_response(
+        user,
+        None,
+        ProfileRelationship::Owner,
+    )?))
 }
 
 pub async fn upload_avatar(
@@ -312,7 +335,11 @@ pub async fn upload_avatar(
         }
     }
 
-    Ok(Json(profile_response(user, None)?))
+    Ok(Json(profile_response(
+        user,
+        None,
+        ProfileRelationship::Owner,
+    )?))
 }
 
 async fn remove_avatar(State(state): State<AppState>, headers: HeaderMap) -> EmptyResult {
@@ -392,37 +419,15 @@ pub async fn list_friends(
         .load(&mut conn)
         .await
         .map_err(internal_error)?;
-    // Friends and callers here are accepted friends of the viewer.
-    let presence_by_user: HashMap<Uuid, bool> = presence
+    let last_seen_by_user: HashMap<Uuid, DateTime<Utc>> = presence
         .into_iter()
-        .map(|entry| {
-            (
-                entry.user_id,
-                presence::is_visibly_online(
-                    entry.user_id,
-                    entry.last_seen_at,
-                    Relationship::FRIEND,
-                ),
-            )
-        })
+        .map(|entry| (entry.user_id, entry.last_seen_at))
         .collect();
-    let users_by_id: HashMap<Uuid, FriendSummary> = related_users
+    let users_by_id: HashMap<Uuid, (FriendSummary, Option<UserStatus>)> = related_users
         .into_iter()
         .map(|user| {
-            let avatar_url = user
-                .avatar_key
-                .as_ref()
-                .map(|key| user_avatar_url(user.id, key));
-            let summary = FriendSummary {
-                id: user.id,
-                name: user.name,
-                nickname: user.nickname,
-                email: user.email,
-                avatar_url,
-                is_online: presence_by_user.get(&user.id).copied().unwrap_or(false),
-                friendship_id: None,
-            };
-            (summary.id, summary)
+            let status = UserStatus::from_db_value(&user.status);
+            (user.id, (friend_summary(user, None), status))
         })
         .collect();
 
@@ -434,12 +439,23 @@ pub async fn list_friends(
         } else {
             relationship.requester_id
         };
-        let Some(mut user) = users_by_id.get(&related_id).cloned() else {
+        let Some((mut user, status)) = users_by_id.get(&related_id).cloned() else {
             continue;
         };
         user.friendship_id = Some(relationship.id);
 
         if relationship.status == "accepted" {
+            if let Some(presence) = status.and_then(|status| {
+                presence::visible_presence(
+                    related_id,
+                    status,
+                    last_seen_by_user.get(&related_id).copied(),
+                    Relationship::FRIEND,
+                )
+            }) {
+                user.status = Some(presence.status);
+                user.is_online = presence.is_online;
+            }
             friends.push(user);
         } else if relationship.addressee_id == user_id {
             incoming_requests.push(FriendRequestItem {
@@ -924,37 +940,24 @@ pub async fn list_incoming_calls(
         .load(&mut conn)
         .await
         .map_err(internal_error)?;
-    // Friends and callers here are accepted friends of the viewer.
-    let presence_by_user: HashMap<Uuid, bool> = presence
+    let last_seen_by_user: HashMap<Uuid, DateTime<Utc>> = presence
         .into_iter()
-        .map(|entry| {
-            (
-                entry.user_id,
-                presence::is_visibly_online(
-                    entry.user_id,
-                    entry.last_seen_at,
-                    Relationship::FRIEND,
-                ),
-            )
-        })
+        .map(|entry| (entry.user_id, entry.last_seen_at))
         .collect();
+    // Calls only come from accepted friends.
     let callers_by_id: HashMap<Uuid, FriendSummary> = callers
         .into_iter()
         .map(|user| {
-            let avatar_url = user
-                .avatar_key
-                .as_ref()
-                .map(|key| user_avatar_url(user.id, key));
-            let summary = FriendSummary {
-                id: user.id,
-                name: user.name,
-                nickname: user.nickname,
-                email: user.email,
-                avatar_url,
-                is_online: presence_by_user.get(&user.id).copied().unwrap_or(false),
-                friendship_id: None,
-            };
-            (summary.id, summary)
+            let id = user.id;
+            let presence = UserStatus::from_db_value(&user.status).and_then(|status| {
+                presence::visible_presence(
+                    id,
+                    status,
+                    last_seen_by_user.get(&id).copied(),
+                    Relationship::FRIEND,
+                )
+            });
+            (id, friend_summary(user, presence))
         })
         .collect();
 
@@ -1133,6 +1136,7 @@ fn is_valid_room_id(room_id: &str) -> bool {
 fn profile_response(
     user: User,
     last_seen_at: Option<DateTime<Utc>>,
+    relationship: ProfileRelationship,
 ) -> Result<UserProfile, (StatusCode, String)> {
     let status = UserStatus::from_db_value(&user.status).ok_or_else(|| {
         tracing::error!(user_id = %user.id, status = %user.status, "Invalid persisted user status");
@@ -1141,21 +1145,94 @@ fn profile_response(
             "Profile unavailable".to_string(),
         )
     })?;
+    let viewer = match relationship {
+        ProfileRelationship::Owner => Some(Relationship::SELF),
+        ProfileRelationship::Friend => Some(Relationship::FRIEND),
+        ProfileRelationship::None => None,
+    };
+    let presence =
+        viewer.and_then(|viewer| presence::visible_presence(user.id, status, last_seen_at, viewer));
+    let is_public_view = relationship == ProfileRelationship::None;
+
     Ok(UserProfile {
-        id: user.id,
-        name: user.name,
-        nickname: user.nickname,
-        email: user.email,
         avatar_url: user
             .avatar_key
             .as_ref()
             .map(|key| user_avatar_url(user.id, key)),
-        status,
-        status_message: user.status_message,
+        id: user.id,
+        name: user.name,
+        nickname: user.nickname,
+        email: if is_public_view {
+            String::new()
+        } else {
+            user.email
+        },
+        status: presence.map_or(UserStatus::Offline, |presence| presence.status),
+        status_message: if is_public_view {
+            String::new()
+        } else {
+            user.status_message
+        },
         created_at: user.created_at,
-        is_online: last_seen_at.is_some_and(presence::is_recent),
-        last_seen_at,
+        is_online: presence.is_some_and(|presence| presence.is_online),
+        last_seen_at: presence.and(last_seen_at),
+        relationship,
     })
+}
+
+fn friend_summary(user: User, presence: Option<presence::VisiblePresence>) -> FriendSummary {
+    FriendSummary {
+        avatar_url: user
+            .avatar_key
+            .as_ref()
+            .map(|key| user_avatar_url(user.id, key)),
+        id: user.id,
+        name: user.name,
+        nickname: user.nickname,
+        email: user.email,
+        is_online: presence.is_some_and(|presence| presence.is_online),
+        status: presence.map(|presence| presence.status),
+        friendship_id: None,
+    }
+}
+
+async fn last_seen_at(
+    conn: &mut diesel_async::AsyncPgConnection,
+    user_id: Uuid,
+) -> Result<Option<DateTime<Utc>>, (StatusCode, String)> {
+    user_presence::table
+        .filter(user_presence::user_id.eq(user_id))
+        .select(user_presence::last_seen_at)
+        .first::<DateTime<Utc>>(conn)
+        .await
+        .optional()
+        .map_err(internal_error)
+}
+
+async fn accepted_friend_ids(
+    conn: &mut diesel_async::AsyncPgConnection,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    Ok(friendships::table
+        .filter(friendships::status.eq("accepted"))
+        .filter(
+            friendships::requester_id
+                .eq(user_id)
+                .or(friendships::addressee_id.eq(user_id)),
+        )
+        .select((friendships::requester_id, friendships::addressee_id))
+        .load::<(Uuid, Uuid)>(conn)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|(requester, addressee)| {
+            if requester == user_id {
+                addressee
+            } else {
+                requester
+            }
+        })
+        .collect())
 }
 
 fn normalize_name(value: &str) -> Option<String> {
@@ -1258,72 +1335,27 @@ pub(super) async fn parse_avatar_upload(
     ))
 }
 
-async fn authorize_profile_access(
+async fn are_friends(
     conn: &mut diesel_async::AsyncPgConnection,
-    requester_id: Uuid,
-    target_user_id: Uuid,
-) -> Result<(), (StatusCode, String)> {
-    if requester_id == target_user_id {
-        return Ok(());
-    }
-
-    let is_friend = friendships::table
+    first_user_id: Uuid,
+    second_user_id: Uuid,
+) -> Result<bool, (StatusCode, String)> {
+    friendships::table
         .filter(friendships::status.eq("accepted"))
         .filter(
             friendships::requester_id
-                .eq(requester_id)
-                .and(friendships::addressee_id.eq(target_user_id))
+                .eq(first_user_id)
+                .and(friendships::addressee_id.eq(second_user_id))
                 .or(friendships::requester_id
-                    .eq(target_user_id)
-                    .and(friendships::addressee_id.eq(requester_id))),
+                    .eq(second_user_id)
+                    .and(friendships::addressee_id.eq(first_user_id))),
         )
         .select(friendships::id)
         .first::<Uuid>(conn)
         .await
         .optional()
-        .map_err(internal_error)?
-        .is_some();
-    if is_friend {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::FORBIDDEN,
-            "Profiles are limited to friends".to_string(),
-        ))
-    }
-}
-
-/// Group members see each other in participant lists, so they may load each other's avatars.
-async fn shares_group(
-    conn: &mut diesel_async::AsyncPgConnection,
-    requester_id: Uuid,
-    target_user_id: Uuid,
-) -> Result<bool, (StatusCode, String)> {
-    let (requester_memberships, target_memberships) = diesel::alias!(
-        conversation_members as requester_memberships,
-        conversation_members as target_memberships
-    );
-    diesel::select(diesel::dsl::exists(
-        requester_memberships
-            .inner_join(
-                target_memberships.on(target_memberships
-                    .field(conversation_members::conversation_id)
-                    .eq(requester_memberships.field(conversation_members::conversation_id))),
-            )
-            .filter(
-                requester_memberships
-                    .field(conversation_members::user_id)
-                    .eq(requester_id),
-            )
-            .filter(
-                target_memberships
-                    .field(conversation_members::user_id)
-                    .eq(target_user_id),
-            ),
-    ))
-    .get_result(conn)
-    .await
-    .map_err(internal_error)
+        .map(|friendship| friendship.is_some())
+        .map_err(internal_error)
 }
 
 fn multipart_error(error: axum::extract::multipart::MultipartError) -> (StatusCode, String) {
