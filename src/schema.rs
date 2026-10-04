@@ -75,6 +75,7 @@ diesel::table! {
         user_id -> Uuid,
         last_read_sequence -> Int8,
         updated_at -> Timestamptz,
+        marked_unread -> Bool,
     }
 }
 
@@ -135,6 +136,19 @@ diesel::table! {
         room_id -> Varchar,
         last_joined_at -> Timestamptz,
         created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    group_invitations (id) {
+        id -> Uuid,
+        conversation_id -> Uuid,
+        inviter_id -> Uuid,
+        invitee_id -> Uuid,
+        #[max_length = 10]
+        status -> Varchar,
+        created_at -> Timestamptz,
+        responded_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -212,6 +226,7 @@ diesel::joinable!(conversation_read_states -> conversations (conversation_id));
 diesel::joinable!(conversation_read_states -> users (user_id));
 diesel::joinable!(call_session_members -> call_sessions (call_session_id));
 diesel::joinable!(call_sessions -> conversations (conversation_id));
+diesel::joinable!(group_invitations -> conversations (conversation_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     call_invitations,
@@ -224,6 +239,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     conversations,
     direct_message_requests,
     friendships,
+    group_invitations,
     meeting_history,
     notifications,
     refresh_tokens,

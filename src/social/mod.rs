@@ -1,6 +1,8 @@
+mod avatars;
 mod call_sessions;
 mod conversations;
 mod events;
+mod group_invitations;
 mod handlers;
 mod messages;
 mod models;

@@ -2,9 +2,8 @@ use std::collections::HashMap;
 
 use axum::{
     Json, Router,
-    body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::Response,
     routing::{delete, get, post},
 };
@@ -20,9 +19,14 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::{extract_user_id, models::User},
-    schema::{call_invitations, friendships, meeting_history, notifications, user_presence, users},
+    schema::{
+        call_invitations, conversation_members, friendships, meeting_history, notifications,
+        user_presence, users,
+    },
     social::{
-        SocialResource, conversation_routes, create_notification, has_matching_if_none_match,
+        SocialResource,
+        avatars::{AvatarQuery, avatar_response, delete_avatar, store_avatar, user_avatar_url},
+        conversation_routes, create_notification,
         models::{
             CallInvitation, CallInvitationResponse, CreateCallRequest, CreateFriendRequest,
             FriendRequestItem, FriendSummary, FriendsResponse, Friendship, MeetingHistory,
@@ -90,13 +94,7 @@ pub async fn search_users(
         StatusCode::BAD_REQUEST,
         "Query must be 2 to 80 characters".to_string(),
     ))?;
-    let pattern = format!(
-        "%{}%",
-        query
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    );
+    let pattern = user_search_pattern(&query);
     let mut conn = state.pool.get().await.map_err(internal_error)?;
 
     let users: Vec<UserDiscovery> = users::table
@@ -147,10 +145,13 @@ pub async fn get_user_avatar(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(user_id): Path<Uuid>,
+    Query(query): Query<AvatarQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let requester_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    authorize_profile_access(&mut conn, requester_id, user_id).await?;
+    if !shares_group(&mut conn, requester_id, user_id).await? {
+        authorize_profile_access(&mut conn, requester_id, user_id).await?;
+    }
     let avatar_key = users::table
         .filter(users::id.eq(user_id))
         .select(users::avatar_key)
@@ -158,34 +159,13 @@ pub async fn get_user_avatar(
         .await
         .map_err(user_not_found)?
         .ok_or((StatusCode::NOT_FOUND, "Avatar not found".to_string()))?;
-    let etag = format!("\"{avatar_key}\"");
-    if has_matching_if_none_match(&headers, &etag) {
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header(header::ETAG, etag)
-            .header(
-                header::CACHE_CONTROL,
-                "private, no-cache, max-age=0, must-revalidate",
-            )
-            .body(Body::empty())
-            .map_err(internal_error);
-    }
-    let avatar = state
-        .avatar_storage
-        .download(&avatar_key)
-        .await
-        .map_err(storage_error)?;
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, avatar.content_type)
-        .header(header::ETAG, etag)
-        .header(
-            header::CACHE_CONTROL,
-            "private, no-cache, max-age=0, must-revalidate",
-        )
-        .body(Body::from(avatar.bytes))
-        .map_err(internal_error)
+    avatar_response(
+        state.avatar_storage.as_ref(),
+        &headers,
+        &avatar_key,
+        query.size,
+    )
+    .await
 }
 
 pub async fn get_self_profile(
@@ -289,11 +269,13 @@ pub async fn upload_avatar(
         .await
         .map_err(user_not_found)?;
     let key = format!("avatars/{user_id}/{}.{}", Uuid::new_v4(), avatar.extension);
-    state
-        .avatar_storage
-        .upload(&key, &avatar.content_type, avatar.bytes)
-        .await
-        .map_err(storage_error)?;
+    store_avatar(
+        state.avatar_storage.as_ref(),
+        &key,
+        &avatar.content_type,
+        avatar.bytes,
+    )
+    .await?;
 
     let update_result: Result<User, diesel::result::Error> =
         diesel::update(users::table.filter(users::id.eq(user_id)))
@@ -307,7 +289,7 @@ pub async fn upload_avatar(
     let user = match update_result {
         Ok(user) => user,
         Err(error) => {
-            if let Err(delete_error) = state.avatar_storage.delete(&key).await {
+            if let Err(delete_error) = delete_avatar(state.avatar_storage.as_ref(), &key).await {
                 tracing::error!(%delete_error, avatar_key = %key, "Failed to remove orphaned avatar");
             }
             return Err(user_not_found(error));
@@ -318,7 +300,7 @@ pub async fn upload_avatar(
         .as_deref()
         .filter(|previous| *previous != key.as_str())
     {
-        if let Err(error) = state.avatar_storage.delete(previous_key).await {
+        if let Err(error) = delete_avatar(state.avatar_storage.as_ref(), previous_key).await {
             tracing::warn!(%error, avatar_key = %previous_key, "Failed to remove replaced avatar");
         }
     }
@@ -354,7 +336,7 @@ async fn remove_avatar(State(state): State<AppState>, headers: HeaderMap) -> Emp
     if cleared == 0 {
         return Ok(StatusCode::NO_CONTENT);
     }
-    if let Err(error) = state.avatar_storage.delete(&avatar_key).await {
+    if let Err(error) = delete_avatar(state.avatar_storage.as_ref(), &avatar_key).await {
         tracing::warn!(%error, %user_id, %avatar_key, "Failed to remove deleted avatar");
     }
     Ok(StatusCode::NO_CONTENT)
@@ -414,7 +396,7 @@ pub async fn list_friends(
             let avatar_url = user
                 .avatar_key
                 .as_ref()
-                .map(|_| format!("/social/users/{}/avatar", user.id));
+                .map(|key| user_avatar_url(user.id, key));
             let summary = FriendSummary {
                 id: user.id,
                 name: user.name,
@@ -464,15 +446,26 @@ pub async fn create_friend_request(
     Json(request): Json<CreateFriendRequest>,
 ) -> EmptyResult {
     let user_id = extract_user_id(&state.jwt, &headers)?;
-    let email = request.email.trim();
-    if email.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Email is required".to_string()));
-    }
+    let email = request
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty());
+    let target_query = users::table.select(User::as_select()).into_boxed();
+    let target_query = match (request.user_id, email) {
+        (Some(target_id), _) => target_query.filter(users::id.eq(target_id)),
+        (None, Some(email)) => target_query.filter(users::email.eq(email)),
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Email or user ID is required".to_string(),
+            ));
+        }
+    };
 
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let target: Option<User> = users::table
-        .filter(users::email.eq(email))
-        .select(User::as_select())
+    // Unknown targets get the same response as a sent request, so accounts cannot be probed.
+    let target: Option<User> = target_query
         .first(&mut conn)
         .await
         .optional()
@@ -926,7 +919,7 @@ pub async fn list_incoming_calls(
             let avatar_url = user
                 .avatar_key
                 .as_ref()
-                .map(|_| format!("/social/users/{}/avatar", user.id));
+                .map(|key| user_avatar_url(user.id, key));
             let summary = FriendSummary {
                 id: user.id,
                 name: user.name,
@@ -1133,7 +1126,7 @@ fn profile_response(
         avatar_url: user
             .avatar_key
             .as_ref()
-            .map(|_| format!("/social/users/{}/avatar", user.id)),
+            .map(|key| user_avatar_url(user.id, key)),
         status,
         status_message: user.status_message,
         created_at: user.created_at,
@@ -1279,6 +1272,39 @@ async fn authorize_profile_access(
     }
 }
 
+/// Group members see each other in participant lists, so they may load each other's avatars.
+async fn shares_group(
+    conn: &mut diesel_async::AsyncPgConnection,
+    requester_id: Uuid,
+    target_user_id: Uuid,
+) -> Result<bool, (StatusCode, String)> {
+    let (requester_memberships, target_memberships) = diesel::alias!(
+        conversation_members as requester_memberships,
+        conversation_members as target_memberships
+    );
+    diesel::select(diesel::dsl::exists(
+        requester_memberships
+            .inner_join(
+                target_memberships.on(target_memberships
+                    .field(conversation_members::conversation_id)
+                    .eq(requester_memberships.field(conversation_members::conversation_id))),
+            )
+            .filter(
+                requester_memberships
+                    .field(conversation_members::user_id)
+                    .eq(requester_id),
+            )
+            .filter(
+                target_memberships
+                    .field(conversation_members::user_id)
+                    .eq(target_user_id),
+            ),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(internal_error)
+}
+
 fn multipart_error(error: axum::extract::multipart::MultipartError) -> (StatusCode, String) {
     tracing::warn!(%error, "Invalid avatar upload");
     (StatusCode::BAD_REQUEST, "Invalid avatar upload".to_string())
@@ -1299,9 +1325,20 @@ fn user_not_found(error: diesel::result::Error) -> (StatusCode, String) {
     }
 }
 
-fn validated_user_search_query(query: &str) -> Option<&str> {
+pub(super) fn validated_user_search_query(query: &str) -> Option<&str> {
     let query = query.trim();
     (2..=80).contains(&query.chars().count()).then_some(query)
+}
+
+/// Builds an `ILIKE` pattern that matches the query literally.
+pub(super) fn user_search_pattern(query: &str) -> String {
+    format!(
+        "%{}%",
+        query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
