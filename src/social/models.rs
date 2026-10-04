@@ -119,6 +119,7 @@ pub struct ConversationMessage {
     pub sender_name: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    pub reply_to_sequence: Option<i64>,
 }
 
 #[derive(Debug, Insertable)]
@@ -128,6 +129,7 @@ pub struct NewConversationMessage {
     pub sender_id: Uuid,
     pub sender_name: String,
     pub content: String,
+    pub reply_to_sequence: Option<i64>,
 }
 
 #[derive(Debug, Queryable, Selectable)]
@@ -375,8 +377,16 @@ pub struct JoinGroupByCodeRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateConversationMessageRequest {
     pub content: String,
+    /// Quotes an earlier message of the same conversation.
+    pub reply_to_sequence: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToggleMessageReactionRequest {
+    pub emoji: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,6 +739,27 @@ pub struct ConversationMessageResponse {
     pub sender_nickname: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    pub reply_to: Option<MessageReplyPreview>,
+    pub reactions: Vec<MessageReactionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReplyPreview {
+    pub sequence: i64,
+    pub sender_id: Uuid,
+    pub sender_name: String,
+    pub sender_nickname: String,
+    /// A short excerpt; the full quoted message stays in the conversation history.
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReactionSummary {
+    pub emoji: String,
+    pub count: i64,
+    pub reacted_by_me: bool,
 }
 
 #[derive(Debug, Serialize)]

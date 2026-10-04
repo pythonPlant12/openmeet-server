@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -5,9 +7,10 @@ use axum::{
 };
 use chrono::Utc;
 use diesel::{
+    deserialize::QueryableByName,
     prelude::*,
     sql_query,
-    sql_types::{BigInt, Uuid as SqlUuid},
+    sql_types::{Array, BigInt, Bool, Text, Uuid as SqlUuid},
 };
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use uuid::Uuid;
@@ -17,14 +20,15 @@ use crate::{
     auth::extract_user_id,
     schema::{
         conversation_hidden_states, conversation_members, conversation_messages, conversations,
-        users,
+        message_reactions, users,
     },
     social::{
         SocialResource,
         models::{
             Conversation, ConversationMessage, ConversationMessageResponse,
             ConversationMessagesResponse, CreateConversationMessageRequest,
-            ListConversationMessagesQuery, NewConversationMessage,
+            ListConversationMessagesQuery, MessageReactionSummary, MessageReplyPreview,
+            NewConversationMessage, ToggleMessageReactionRequest,
         },
     },
 };
@@ -32,6 +36,9 @@ use crate::{
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 type CreateApiResult<T> = Result<(StatusCode, Json<T>), (StatusCode, String)>;
 type EmptyResult = Result<StatusCode, (StatusCode, String)>;
+
+const REPLY_PREVIEW_CHARACTERS: usize = 140;
+const MAX_REACTION_BYTES: usize = 32;
 
 #[derive(Debug)]
 struct MessageError {
@@ -66,12 +73,16 @@ pub(crate) async fn create_message(
 ) -> CreateApiResult<ConversationMessageResponse> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let content = validate_message_content(&request.content)?;
+    let reply_to_sequence = request.reply_to_sequence;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
 
     let (message, sender_nickname, recipients): (ConversationMessage, String, Vec<Uuid>) = conn
         .transaction(|conn| {
             async move {
                 authorize_conversation_access(conn, conversation_id, user_id).await?;
+                if let Some(sequence) = reply_to_sequence {
+                    ensure_message_in_conversation(conn, conversation_id, sequence).await?;
+                }
                 let recipients = conversation_participants(conn, conversation_id).await?;
                 let (sender_name, sender_nickname) = users::table
                     .find(user_id)
@@ -85,6 +96,7 @@ pub(crate) async fn create_message(
                         sender_id: user_id,
                         sender_name,
                         content,
+                        reply_to_sequence,
                     })
                     .returning(ConversationMessage::as_returning())
                     .get_result(conn)
@@ -115,10 +127,206 @@ pub(crate) async fn create_message(
         .social_events
         .publish(recipients, SocialResource::Conversations);
 
+    let reply_to = match message.reply_to_sequence {
+        Some(sequence) => reply_previews(&mut conn, conversation_id, &[sequence])
+            .await?
+            .remove(&sequence),
+        None => None,
+    };
     Ok((
         StatusCode::CREATED,
-        Json(message_response(message, sender_nickname)),
+        Json(message_response(
+            message,
+            sender_nickname,
+            reply_to,
+            Vec::new(),
+        )),
     ))
+}
+
+/// Adds the viewer's reaction, or removes it when the same emoji is sent again.
+pub(crate) async fn toggle_message_reaction(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((conversation_id, sequence)): Path<(Uuid, i64)>,
+    Json(request): Json<ToggleMessageReactionRequest>,
+) -> ApiResult<Vec<MessageReactionSummary>> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let emoji = validate_reaction(&request.emoji)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let recipients = conn
+        .transaction(|conn| {
+            async move {
+                authorize_conversation_access(conn, conversation_id, user_id).await?;
+                ensure_message_in_conversation(conn, conversation_id, sequence).await?;
+                let removed = diesel::delete(
+                    message_reactions::table
+                        .filter(message_reactions::message_sequence.eq(sequence))
+                        .filter(message_reactions::user_id.eq(user_id))
+                        .filter(message_reactions::emoji.eq(&emoji)),
+                )
+                .execute(conn)
+                .await?;
+                if removed == 0 {
+                    diesel::insert_into(message_reactions::table)
+                        .values((
+                            message_reactions::message_sequence.eq(sequence),
+                            message_reactions::user_id.eq(user_id),
+                            message_reactions::emoji.eq(&emoji),
+                        ))
+                        .execute(conn)
+                        .await?;
+                }
+                Ok::<_, MessageError>(conversation_participants(conn, conversation_id).await?)
+            }
+            .scope_boxed()
+        })
+        .await
+        .map_err(MessageError::into_api_error)?;
+
+    state
+        .social_events
+        .publish(recipients, SocialResource::Conversations);
+
+    Ok(Json(
+        reaction_summaries(&mut conn, user_id, &[sequence])
+            .await?
+            .remove(&sequence)
+            .unwrap_or_default(),
+    ))
+}
+
+async fn ensure_message_in_conversation(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conversation_id: Uuid,
+    sequence: i64,
+) -> Result<(), (StatusCode, String)> {
+    conversation_messages::table
+        .filter(conversation_messages::sequence.eq(sequence))
+        .filter(conversation_messages::conversation_id.eq(conversation_id))
+        .select(conversation_messages::sequence)
+        .first::<i64>(conn)
+        .await
+        .optional()
+        .map_err(internal_error)?
+        .map(|_| ())
+        .ok_or((StatusCode::NOT_FOUND, "Message not found".to_string()))
+}
+
+async fn reply_previews(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conversation_id: Uuid,
+    sequences: &[i64],
+) -> Result<HashMap<i64, MessageReplyPreview>, (StatusCode, String)> {
+    if sequences.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(i64, Uuid, String, String, String)> = conversation_messages::table
+        .inner_join(users::table.on(users::id.eq(conversation_messages::sender_id)))
+        .filter(conversation_messages::conversation_id.eq(conversation_id))
+        .filter(conversation_messages::sequence.eq_any(sequences))
+        .select((
+            conversation_messages::sequence,
+            conversation_messages::sender_id,
+            conversation_messages::sender_name,
+            users::nickname,
+            conversation_messages::content,
+        ))
+        .load(conn)
+        .await
+        .map_err(internal_error)?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(sequence, sender_id, sender_name, sender_nickname, content)| {
+                (
+                    sequence,
+                    MessageReplyPreview {
+                        sequence,
+                        sender_id,
+                        sender_name,
+                        sender_nickname,
+                        content: excerpt(&content),
+                    },
+                )
+            },
+        )
+        .collect())
+}
+
+#[derive(QueryableByName)]
+struct ReactionRow {
+    #[diesel(sql_type = BigInt)]
+    message_sequence: i64,
+    #[diesel(sql_type = Text)]
+    emoji: String,
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+    #[diesel(sql_type = Bool)]
+    reacted_by_me: bool,
+}
+
+async fn reaction_summaries(
+    conn: &mut diesel_async::AsyncPgConnection,
+    viewer_id: Uuid,
+    sequences: &[i64],
+) -> Result<HashMap<i64, Vec<MessageReactionSummary>>, (StatusCode, String)> {
+    if sequences.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<ReactionRow> = sql_query(
+        "SELECT message_sequence, emoji, COUNT(*)::BIGINT AS count,
+                BOOL_OR(user_id = $1) AS reacted_by_me
+         FROM message_reactions
+         WHERE message_sequence = ANY($2)
+         GROUP BY message_sequence, emoji
+         ORDER BY message_sequence, MIN(created_at), emoji",
+    )
+    .bind::<SqlUuid, _>(viewer_id)
+    .bind::<Array<BigInt>, _>(sequences.to_vec())
+    .load(conn)
+    .await
+    .map_err(internal_error)?;
+
+    let mut summaries: HashMap<i64, Vec<MessageReactionSummary>> = HashMap::new();
+    for row in rows {
+        summaries
+            .entry(row.message_sequence)
+            .or_default()
+            .push(MessageReactionSummary {
+                emoji: row.emoji,
+                count: row.count,
+                reacted_by_me: row.reacted_by_me,
+            });
+    }
+    Ok(summaries)
+}
+
+fn excerpt(content: &str) -> String {
+    let mut characters = content.chars();
+    let mut preview: String = characters.by_ref().take(REPLY_PREVIEW_CHARACTERS).collect();
+    if characters.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
+/// Reactions are emoji: short, with no letters, spaces, or control characters.
+fn validate_reaction(emoji: &str) -> Result<String, (StatusCode, String)> {
+    let emoji = emoji.trim();
+    let valid = !emoji.is_empty()
+        && emoji.len() <= MAX_REACTION_BYTES
+        && emoji.chars().all(|character| {
+            !character.is_alphanumeric() && !character.is_whitespace() && !character.is_control()
+        });
+    if valid {
+        Ok(emoji.to_string())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "Reaction must be a single emoji".to_string(),
+        ))
+    }
 }
 
 async fn conversation_participants(
@@ -192,10 +400,27 @@ pub(crate) async fn list_messages(
         mark_messages_read(&mut conn, conversation_id, user_id, latest_sequence).await?;
     }
 
+    let sequences = messages
+        .iter()
+        .map(|(message, _)| message.sequence)
+        .collect::<Vec<_>>();
+    let reply_sequences = messages
+        .iter()
+        .filter_map(|(message, _)| message.reply_to_sequence)
+        .collect::<Vec<_>>();
+    let replies = reply_previews(&mut conn, conversation_id, &reply_sequences).await?;
+    let mut reactions = reaction_summaries(&mut conn, user_id, &sequences).await?;
+
     Ok(Json(ConversationMessagesResponse {
         messages: messages
             .into_iter()
-            .map(|(message, sender_nickname)| message_response(message, sender_nickname))
+            .map(|(message, sender_nickname)| {
+                let reply_to = message
+                    .reply_to_sequence
+                    .and_then(|sequence| replies.get(&sequence).cloned());
+                let message_reactions = reactions.remove(&message.sequence).unwrap_or_default();
+                message_response(message, sender_nickname, reply_to, message_reactions)
+            })
             .collect(),
         next_before,
     }))
@@ -336,6 +561,8 @@ async fn authorize_conversation_access(
 fn message_response(
     message: ConversationMessage,
     sender_nickname: String,
+    reply_to: Option<MessageReplyPreview>,
+    reactions: Vec<MessageReactionSummary>,
 ) -> ConversationMessageResponse {
     ConversationMessageResponse {
         sequence: message.sequence,
@@ -345,6 +572,8 @@ fn message_response(
         sender_nickname,
         content: message.content,
         created_at: message.created_at,
+        reply_to,
+        reactions,
     }
 }
 
@@ -390,7 +619,31 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 mod tests {
     use axum::http::StatusCode;
 
-    use super::{ListConversationMessagesQuery, validate_message_content, validate_message_page};
+    use super::{
+        ListConversationMessagesQuery, excerpt, validate_message_content, validate_message_page,
+        validate_reaction,
+    };
+
+    #[test]
+    fn accepts_emoji_reactions_only() {
+        for emoji in ["👍", "❤️", "👨‍👩‍👧", "🇪🇸"] {
+            assert_eq!(validate_reaction(emoji).unwrap(), emoji);
+        }
+        for invalid in ["", "  ", "lol", "a👍", "👍 👍", &"👍".repeat(9)] {
+            assert_eq!(
+                validate_reaction(invalid).unwrap_err().0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn shortens_long_quotes_with_an_ellipsis() {
+        assert_eq!(excerpt("short"), "short");
+        let long = "a".repeat(200);
+        assert_eq!(excerpt(&long).chars().count(), 141);
+        assert!(excerpt(&long).ends_with('…'));
+    }
 
     #[test]
     fn trims_message_content_without_changing_internal_newlines() {

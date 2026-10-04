@@ -39,6 +39,7 @@ use crate::{
         },
         messages::{
             create_message, list_messages, mark_conversation_read, mark_conversation_unread,
+            toggle_message_reaction,
         },
         models::{
             AddConversationMemberRequest, Conversation, ConversationKind, ConversationMember,
@@ -139,6 +140,10 @@ pub fn conversation_routes() -> Router<AppState> {
             post(respond_to_direct_message_request),
         )
         .route("/{id}/messages", get(list_messages).post(create_message))
+        .route(
+            "/{id}/messages/{sequence}/reactions",
+            post(toggle_message_reaction),
+        )
         .route("/{id}/read", post(mark_conversation_read))
         .route("/{id}/unread", post(mark_conversation_unread))
         .route("/{id}", delete(hide_direct_conversation))
