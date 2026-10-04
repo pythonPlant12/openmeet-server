@@ -2257,6 +2257,29 @@ mod tests {
     }
 
     #[test]
+    fn group_ids_are_the_exact_base62_value_of_the_uuid() {
+        // Exact 128-bit arithmetic is the reference the database function must also match.
+        const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        for uuid in [
+            Uuid::nil(),
+            Uuid::max(),
+            Uuid::parse_str("418874e5-a2f5-4b14-a177-2353e0e9061d").unwrap(),
+        ] {
+            let mut value = uuid.as_u128();
+            let mut expected = [b'0'; 22];
+            for character in expected.iter_mut().rev() {
+                *character = ALPHABET[(value % 62) as usize];
+                value /= 62;
+            }
+            assert_eq!(group_code_from_uuid(uuid).as_bytes(), expected);
+        }
+        assert_eq!(
+            group_code_from_uuid(Uuid::parse_str("418874e5-a2f5-4b14-a177-2353e0e9061d").unwrap()),
+            "1zerRwRYnyht7gsK8shFaX"
+        );
+    }
+
+    #[test]
     fn normalizes_group_codes_for_lookup() {
         assert_eq!(
             normalize_group_code("  2aIFX0J6L4w7Y9KzQp8VrN  "),
