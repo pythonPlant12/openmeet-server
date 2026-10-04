@@ -159,23 +159,24 @@ pub(crate) async fn toggle_message_reaction(
             async move {
                 authorize_conversation_access(conn, conversation_id, user_id).await?;
                 ensure_message_in_conversation(conn, conversation_id, sequence).await?;
-                let removed = diesel::delete(
-                    message_reactions::table
-                        .filter(message_reactions::message_sequence.eq(sequence))
-                        .filter(message_reactions::user_id.eq(user_id))
-                        .filter(message_reactions::emoji.eq(&emoji)),
-                )
-                .execute(conn)
-                .await?;
-                if removed == 0 {
-                    diesel::insert_into(message_reactions::table)
-                        .values((
-                            message_reactions::message_sequence.eq(sequence),
-                            message_reactions::user_id.eq(user_id),
-                            message_reactions::emoji.eq(&emoji),
-                        ))
-                        .execute(conn)
-                        .await?;
+                let inserted = diesel::insert_into(message_reactions::table)
+                    .values((
+                        message_reactions::message_sequence.eq(sequence),
+                        message_reactions::user_id.eq(user_id),
+                        message_reactions::emoji.eq(&emoji),
+                    ))
+                    .on_conflict_do_nothing()
+                    .execute(conn)
+                    .await?;
+                if inserted == 0 {
+                    diesel::delete(
+                        message_reactions::table
+                            .filter(message_reactions::message_sequence.eq(sequence))
+                            .filter(message_reactions::user_id.eq(user_id))
+                            .filter(message_reactions::emoji.eq(&emoji)),
+                    )
+                    .execute(conn)
+                    .await?;
                 }
                 Ok::<_, MessageError>(conversation_participants(conn, conversation_id).await?)
             }
