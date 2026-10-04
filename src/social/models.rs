@@ -606,6 +606,7 @@ pub struct GroupMemberResponse {
     pub name: String,
     pub nickname: String,
     pub avatar_url: Option<String>,
+    pub is_online: bool,
     pub role: String,
     pub joined_at: DateTime<Utc>,
 }
