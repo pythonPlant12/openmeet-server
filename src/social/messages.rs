@@ -31,6 +31,7 @@ use crate::{
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 type CreateApiResult<T> = Result<(StatusCode, Json<T>), (StatusCode, String)>;
+type EmptyResult = Result<StatusCode, (StatusCode, String)>;
 
 #[derive(Debug)]
 struct MessageError {
@@ -67,14 +68,14 @@ pub(crate) async fn create_message(
     let content = validate_message_content(&request.content)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
 
-    let (message, recipients): (ConversationMessage, Vec<Uuid>) = conn
+    let (message, sender_nickname, recipients): (ConversationMessage, String, Vec<Uuid>) = conn
         .transaction(|conn| {
             async move {
                 authorize_conversation_access(conn, conversation_id, user_id).await?;
                 let recipients = conversation_participants(conn, conversation_id).await?;
-                let sender_name = users::table
+                let (sender_name, sender_nickname) = users::table
                     .find(user_id)
-                    .select(users::name)
+                    .select((users::name, users::nickname))
                     .first(conn)
                     .await
                     .map_err(internal_error)?;
@@ -103,7 +104,7 @@ pub(crate) async fn create_message(
                 .await
                 .map_err(internal_error)?;
 
-                Ok((message, recipients))
+                Ok((message, sender_nickname, recipients))
             }
             .scope_boxed()
         })
@@ -114,7 +115,10 @@ pub(crate) async fn create_message(
         .social_events
         .publish(recipients, SocialResource::Conversations);
 
-    Ok((StatusCode::CREATED, Json(message_response(message))))
+    Ok((
+        StatusCode::CREATED,
+        Json(message_response(message, sender_nickname)),
+    ))
 }
 
 async fn conversation_participants(
@@ -164,30 +168,92 @@ pub(crate) async fn list_messages(
     if let Some(before) = before {
         message_query = message_query.filter(conversation_messages::sequence.lt(before));
     }
-    let mut messages: Vec<ConversationMessage> = message_query
+    let mut messages: Vec<(ConversationMessage, String)> = message_query
+        .inner_join(users::table.on(users::id.eq(conversation_messages::sender_id)))
         .order(conversation_messages::sequence.desc())
         .limit(limit + 1)
-        .select(ConversationMessage::as_select())
+        .select((ConversationMessage::as_select(), users::nickname))
         .load(&mut conn)
         .await
         .map_err(internal_error)?;
     let next_before = if messages.len() as i64 > limit {
         messages.truncate(limit as usize);
-        messages.last().map(|message| message.sequence)
+        messages.last().map(|(message, _)| message.sequence)
     } else {
         None
     };
 
     if is_latest_page {
-        if let Some(latest_sequence) = messages.as_slice().first().map(|message| message.sequence) {
-            mark_messages_read(&mut conn, conversation_id, user_id, latest_sequence).await?;
-        }
+        let latest_sequence = messages
+            .as_slice()
+            .first()
+            .map(|(message, _)| message.sequence)
+            .unwrap_or(0);
+        mark_messages_read(&mut conn, conversation_id, user_id, latest_sequence).await?;
     }
 
     Ok(Json(ConversationMessagesResponse {
-        messages: messages.into_iter().map(message_response).collect(),
+        messages: messages
+            .into_iter()
+            .map(|(message, sender_nickname)| message_response(message, sender_nickname))
+            .collect(),
         next_before,
     }))
+}
+
+pub(crate) async fn mark_conversation_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<Uuid>,
+) -> EmptyResult {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    authorize_conversation_access(&mut conn, conversation_id, user_id).await?;
+    let latest_sequence: Option<i64> = conversation_messages::table
+        .filter(conversation_messages::conversation_id.eq(conversation_id))
+        .select(diesel::dsl::max(conversation_messages::sequence))
+        .first(&mut conn)
+        .await
+        .map_err(internal_error)?;
+    mark_messages_read(
+        &mut conn,
+        conversation_id,
+        user_id,
+        latest_sequence.unwrap_or(0),
+    )
+    .await?;
+    // Other open sessions of the same user refresh their unread badges.
+    state
+        .social_events
+        .publish([user_id], SocialResource::Conversations);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Flags a conversation as unread for the current user without changing message read progress.
+/// Opening the conversation clears the flag.
+pub(crate) async fn mark_conversation_unread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<Uuid>,
+) -> EmptyResult {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    authorize_conversation_access(&mut conn, conversation_id, user_id).await?;
+    sql_query(
+        "INSERT INTO conversation_read_states (conversation_id, user_id, marked_unread)
+         VALUES ($1, $2, TRUE)
+         ON CONFLICT (conversation_id, user_id) DO UPDATE
+         SET marked_unread = TRUE, updated_at = NOW()",
+    )
+    .bind::<SqlUuid, _>(conversation_id)
+    .bind::<SqlUuid, _>(user_id)
+    .execute(&mut conn)
+    .await
+    .map_err(internal_error)?;
+    state
+        .social_events
+        .publish([user_id], SocialResource::Conversations);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn mark_messages_read(
@@ -204,6 +270,7 @@ async fn mark_messages_read(
                  conversation_read_states.last_read_sequence,
                  EXCLUDED.last_read_sequence
              ),
+             marked_unread = FALSE,
              updated_at = NOW()",
     )
     .bind::<SqlUuid, _>(conversation_id)
@@ -266,12 +333,16 @@ async fn authorize_conversation_access(
     }
 }
 
-fn message_response(message: ConversationMessage) -> ConversationMessageResponse {
+fn message_response(
+    message: ConversationMessage,
+    sender_nickname: String,
+) -> ConversationMessageResponse {
     ConversationMessageResponse {
         sequence: message.sequence,
         conversation_id: message.conversation_id,
         sender_id: message.sender_id,
         sender_name: message.sender_name,
+        sender_nickname,
         content: message.content,
         created_at: message.created_at,
     }

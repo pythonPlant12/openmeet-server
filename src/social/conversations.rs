@@ -6,9 +6,8 @@ use argon2::{
 };
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::Response,
     routing::{delete, get, post},
 };
@@ -18,7 +17,7 @@ use diesel::{
     dsl::{exists, not},
     prelude::*,
     sql_query,
-    sql_types::{Array, BigInt, Uuid as SqlUuid},
+    sql_types::{Array, BigInt, Bool, Text, Uuid as SqlUuid},
 };
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use uuid::Uuid;
@@ -32,31 +31,41 @@ use crate::{
     },
     social::{
         SocialResource,
-        handlers::{MAX_AVATAR_UPLOAD_BYTES, parse_avatar_upload, storage_error},
-        messages::{create_message, list_messages},
+        avatars::{AvatarQuery, avatar_response, delete_avatar, store_avatar, user_avatar_url},
+        group_invitations,
+        handlers::{
+            MAX_AVATAR_UPLOAD_BYTES, parse_avatar_upload, user_search_pattern,
+            validated_user_search_query,
+        },
+        messages::{
+            create_message, list_messages, mark_conversation_read, mark_conversation_unread,
+        },
         models::{
             AddConversationMemberRequest, Conversation, ConversationKind, ConversationMember,
             ConversationResponse, CreateGroupRequest, DirectMessageRequest,
-            DirectMessageRequestResponse, GroupAccessPolicy, GroupCodeInfoRequest,
-            GroupInfoResponse, GroupMemberResponse, JoinGroupByCodeRequest, JoinGroupRequest,
-            NewConversation, NewConversationMember, NewDirectMessageRequest, NewRevokedSfuRoom,
-            OpenDirectConversationResponse, RespondToDirectMessageRequest,
+            DirectMessageRequestResponse, GroupAccessPolicy, GroupCandidate, GroupCandidatesPage,
+            GroupCandidatesQuery, GroupCodeInfoRequest, GroupInfoResponse, GroupMemberResponse,
+            GroupMembersPage, JoinGroupByCodeRequest, JoinGroupRequest, NewConversation,
+            NewConversationMember, NewDirectMessageRequest, NewRevokedSfuRoom,
+            OpenDirectConversationResponse, PageQuery, RespondToDirectMessageRequest,
             UpdateConversationMemberRoleRequest, UpdateGroupPolicyRequest, UpdateGroupRequest,
         },
     },
 };
 
+const GROUP_PAGE_SIZE: i64 = 50;
+
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 type EmptyResult = Result<StatusCode, (StatusCode, String)>;
 
 #[derive(Debug)]
-struct ConversationError {
+pub(super) struct ConversationError {
     status: StatusCode,
     message: String,
 }
 
 impl ConversationError {
-    fn into_api_error(self) -> (StatusCode, String) {
+    pub(super) fn into_api_error(self) -> (StatusCode, String) {
         (self.status, self.message)
     }
 }
@@ -88,11 +97,29 @@ pub fn conversation_routes() -> Router<AppState> {
             "/groups/{id}/avatar",
             get(get_group_avatar)
                 .post(upload_group_avatar)
+                .delete(remove_group_avatar)
                 .layer(DefaultBodyLimit::max(MAX_AVATAR_UPLOAD_BYTES)),
         )
         .route(
             "/groups/{id}/members",
             get(list_group_members).post(add_group_member),
+        )
+        .route("/groups/{id}/candidates", get(list_group_candidates))
+        .route(
+            "/groups/{id}/invitations",
+            post(group_invitations::create_group_invitation),
+        )
+        .route(
+            "/groups/invitations",
+            get(group_invitations::list_group_invitations),
+        )
+        .route(
+            "/groups/invitations/{id}/accept",
+            post(group_invitations::accept_group_invitation),
+        )
+        .route(
+            "/groups/invitations/{id}/decline",
+            post(group_invitations::decline_group_invitation),
         )
         .route(
             "/groups/{id}/members/{user_id}",
@@ -110,6 +137,8 @@ pub fn conversation_routes() -> Router<AppState> {
             post(respond_to_direct_message_request),
         )
         .route("/{id}/messages", get(list_messages).post(create_message))
+        .route("/{id}/read", post(mark_conversation_read))
+        .route("/{id}/unread", post(mark_conversation_unread))
         .route("/{id}", delete(hide_direct_conversation))
 }
 
@@ -183,6 +212,7 @@ async fn list_conversations(
         let counts = message_counts.get(&conversation.id);
         conversation.message_count = counts.map(|counts| counts.message_count).unwrap_or(0);
         conversation.unread_count = counts.map(|counts| counts.unread_count).unwrap_or(0);
+        conversation.marked_unread = counts.is_some_and(|counts| counts.marked_unread);
     }
     response.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
 
@@ -208,7 +238,8 @@ async fn create_group(
     validate_password_for_policy(request.access_policy, request.password.as_deref())?;
     let member_ids = validate_initial_member_ids(user_id, request.member_ids)?;
     let password_hash = hash_group_password(request.password).await?;
-    let group_code = generate_group_code();
+    let group_id = Uuid::new_v4();
+    let group_code = group_code_from_uuid(group_id);
     let mut conn = state.pool.get().await.map_err(internal_error)?;
     let initial_member_ids = member_ids.clone();
     let access_policy = request.access_policy;
@@ -220,6 +251,7 @@ async fn create_group(
 
                 let conversation: Conversation = diesel::insert_into(conversations::table)
                     .values(NewConversation {
+                        id: group_id,
                         kind: "group".to_string(),
                         creator_id: user_id,
                         title: Some(title),
@@ -228,6 +260,7 @@ async fn create_group(
                         direct_user_low_id: None,
                         direct_user_high_id: None,
                         group_code: Some(group_code),
+                        legacy_group_code: None,
                         avatar_key: None,
                     })
                     .returning(Conversation::as_returning())
@@ -340,8 +373,10 @@ async fn list_group_members(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(group_id): Path<Uuid>,
-) -> ApiResult<Vec<GroupMemberResponse>> {
+    Query(page): Query<PageQuery>,
+) -> ApiResult<GroupMembersPage> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
+    let offset = validated_page_offset(page.offset)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
     load_group(&mut conn, group_id).await?;
 
@@ -352,31 +387,155 @@ async fn list_group_members(
         return Err((StatusCode::NOT_FOUND, "Group not found".to_string()));
     }
 
-    let members: Vec<(Uuid, String, String, chrono::DateTime<Utc>)> = conversation_members::table
+    let mut members: Vec<(
+        Uuid,
+        String,
+        String,
+        Option<String>,
+        String,
+        chrono::DateTime<Utc>,
+    )> = conversation_members::table
         .inner_join(users::table.on(users::id.eq(conversation_members::user_id)))
         .filter(conversation_members::conversation_id.eq(group_id))
         .order((conversation_members::joined_at.asc(), users::id.asc()))
         .select((
             users::id,
             users::name,
+            users::nickname,
+            users::avatar_key,
             conversation_members::role,
             conversation_members::joined_at,
         ))
+        .offset(offset)
+        .limit(GROUP_PAGE_SIZE + 1)
         .load(&mut conn)
         .await
         .map_err(internal_error)?;
+    let next_offset = next_page_offset(&mut members, offset);
 
-    Ok(Json(
-        members
+    Ok(Json(GroupMembersPage {
+        members: members
             .into_iter()
-            .map(|(id, name, role, joined_at)| GroupMemberResponse {
-                id,
-                name,
-                role,
-                joined_at,
+            .map(
+                |(id, name, nickname, avatar_key, role, joined_at)| GroupMemberResponse {
+                    id,
+                    name,
+                    nickname,
+                    avatar_url: avatar_key.map(|key| user_avatar_url(id, &key)),
+                    role,
+                    joined_at,
+                },
+            )
+            .collect(),
+        next_offset,
+    }))
+}
+
+/// Lists people an admin may add to the group, filtered by the group's access policy.
+async fn list_group_candidates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+    Query(request): Query<GroupCandidatesQuery>,
+) -> ApiResult<GroupCandidatesPage> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let offset = validated_page_offset(request.offset)?;
+    let query = validated_user_search_query(&request.query).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Query must be 2 to 80 characters".to_string(),
+    ))?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let group = require_group_admin(&mut conn, group_id, user_id).await?;
+    let policy = group_policy(&group)?;
+
+    let mut candidates: Vec<GroupCandidateRow> = sql_query(
+        "SELECT candidate.id, candidate.name, candidate.nickname, candidate.email
+         FROM users AS candidate
+         WHERE candidate.id <> $1
+           AND NOT EXISTS (
+               SELECT 1 FROM conversation_members AS member
+               WHERE member.conversation_id = $2 AND member.user_id = candidate.id
+           )
+           AND (candidate.name ILIKE $3 OR candidate.email ILIKE $3 OR candidate.nickname ILIKE $3)
+           AND CASE $4
+               WHEN 'friends_of_friends' THEN EXISTS (
+                   SELECT 1
+                   FROM conversation_members AS member
+                   JOIN friendships AS friendship
+                     ON friendship.status = 'accepted'
+                    AND ((friendship.requester_id = member.user_id AND friendship.addressee_id = candidate.id)
+                      OR (friendship.addressee_id = member.user_id AND friendship.requester_id = candidate.id))
+                   WHERE member.conversation_id = $2
+               )
+               WHEN 'friends_only' THEN NOT EXISTS (
+                   SELECT 1
+                   FROM conversation_members AS member
+                   WHERE member.conversation_id = $2
+                     AND NOT EXISTS (
+                         SELECT 1 FROM friendships AS friendship
+                         WHERE friendship.status = 'accepted'
+                           AND ((friendship.requester_id = member.user_id AND friendship.addressee_id = candidate.id)
+                             OR (friendship.addressee_id = member.user_id AND friendship.requester_id = candidate.id))
+                     )
+               )
+               ELSE TRUE
+           END
+         ORDER BY candidate.name, candidate.email, candidate.id
+         OFFSET $5
+         LIMIT $6",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<SqlUuid, _>(group_id)
+    .bind::<Text, _>(user_search_pattern(&query))
+    .bind::<Text, _>(policy.as_db_value())
+    .bind::<BigInt, _>(offset)
+    .bind::<BigInt, _>(GROUP_PAGE_SIZE + 1)
+    .load(&mut conn)
+    .await
+    .map_err(internal_error)?;
+    let next_offset = next_page_offset(&mut candidates, offset);
+
+    Ok(Json(GroupCandidatesPage {
+        results: candidates
+            .into_iter()
+            .map(|candidate| GroupCandidate {
+                id: candidate.id,
+                name: candidate.name,
+                nickname: candidate.nickname,
+                email: candidate.email,
             })
             .collect(),
-    ))
+        next_offset,
+    }))
+}
+
+#[derive(QueryableByName)]
+struct GroupCandidateRow {
+    #[diesel(sql_type = SqlUuid)]
+    id: Uuid,
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Text)]
+    nickname: String,
+    #[diesel(sql_type = Text)]
+    email: String,
+}
+
+fn validated_page_offset(offset: Option<i64>) -> Result<i64, (StatusCode, String)> {
+    match offset.unwrap_or(0) {
+        offset if offset >= 0 => Ok(offset),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "Offset must not be negative".to_string(),
+        )),
+    }
+}
+
+/// Trims the extra look-ahead row and returns the offset of the next page, if one exists.
+fn next_page_offset<T>(rows: &mut Vec<T>, offset: i64) -> Option<i64> {
+    let has_more = rows.len() as i64 > GROUP_PAGE_SIZE;
+    rows.truncate(GROUP_PAGE_SIZE as usize);
+    has_more.then_some(offset + GROUP_PAGE_SIZE)
 }
 
 async fn join_group(
@@ -586,7 +745,6 @@ async fn remove_group_member(
 ) -> EmptyResult {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let replacement_code = generate_group_code();
     let room_ids = conn
         .transaction(|conn| {
             async move {
@@ -612,10 +770,7 @@ async fn remove_group_member(
                 }
                 let room_ids = revoke_group_call_memberships(conn, group_id, member_id).await?;
                 diesel::update(conversations::table.find(group_id))
-                    .set((
-                        conversations::group_code.eq(replacement_code),
-                        conversations::updated_at.eq(Utc::now()),
-                    ))
+                    .set(conversations::updated_at.eq(Utc::now()))
                     .execute(conn)
                     .await?;
                 Ok(room_ids)
@@ -741,7 +896,7 @@ async fn delete_group(
         .social_events
         .publish(call_recipients, SocialResource::Calls);
     if let Some(avatar_key) = avatar_key
-        && let Err(error) = state.avatar_storage.delete(&avatar_key).await
+        && let Err(error) = delete_avatar(state.avatar_storage.as_ref(), &avatar_key).await
     {
         tracing::warn!(%error, %group_id, %avatar_key, "Failed to remove deleted group avatar");
     }
@@ -752,6 +907,7 @@ async fn get_group_avatar(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(group_id): Path<Uuid>,
+    Query(query): Query<AvatarQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
@@ -765,18 +921,49 @@ async fn get_group_avatar(
     let avatar_key = group
         .avatar_key
         .ok_or((StatusCode::NOT_FOUND, "Avatar not found".to_string()))?;
-    let avatar = state
-        .avatar_storage
-        .download(&avatar_key)
-        .await
-        .map_err(storage_error)?;
+    avatar_response(
+        state.avatar_storage.as_ref(),
+        &headers,
+        &avatar_key,
+        query.size,
+    )
+    .await
+}
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, avatar.content_type)
-        .header(header::CACHE_CONTROL, "private, no-store")
-        .body(Body::from(avatar.bytes))
-        .map_err(internal_error)
+async fn remove_group_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+) -> EmptyResult {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let avatar_key = conn
+        .transaction(|conn| {
+            async move {
+                let (group, _) = require_group_admin_for_update(conn, group_id, user_id).await?;
+                let Some(avatar_key) = group.avatar_key else {
+                    return Ok(None);
+                };
+                diesel::update(conversations::table.find(group_id))
+                    .set((
+                        conversations::avatar_key.eq(None::<String>),
+                        conversations::updated_at.eq(Utc::now()),
+                    ))
+                    .execute(conn)
+                    .await?;
+                Ok(Some(avatar_key))
+            }
+            .scope_boxed()
+        })
+        .await
+        .map_err(ConversationError::into_api_error)?;
+    if let Some(avatar_key) = avatar_key {
+        if let Err(error) = delete_avatar(state.avatar_storage.as_ref(), &avatar_key).await {
+            tracing::warn!(%error, %group_id, %avatar_key, "Failed to remove deleted group avatar");
+        }
+        publish_group_update(&state, &mut conn, group_id, &[]).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn upload_group_avatar(
@@ -796,16 +983,18 @@ async fn upload_group_avatar(
         Uuid::new_v4(),
         avatar.extension
     );
-    state
-        .avatar_storage
-        .upload(&key, &avatar.content_type, avatar.bytes)
-        .await
-        .map_err(storage_error)?;
+    store_avatar(
+        state.avatar_storage.as_ref(),
+        &key,
+        &avatar.content_type,
+        avatar.bytes,
+    )
+    .await?;
 
     let mut conn = match state.pool.get().await {
         Ok(conn) => conn,
         Err(error) => {
-            if let Err(delete_error) = state.avatar_storage.delete(&key).await {
+            if let Err(delete_error) = delete_avatar(state.avatar_storage.as_ref(), &key).await {
                 tracing::error!(%delete_error, avatar_key = %key, "Failed to remove orphaned group avatar");
             }
             return Err(internal_error(error));
@@ -833,7 +1022,7 @@ async fn upload_group_avatar(
     let (updated, role, previous_avatar_key) = match update_result {
         Ok(updated) => updated,
         Err(error) => {
-            if let Err(delete_error) = state.avatar_storage.delete(&key).await {
+            if let Err(delete_error) = delete_avatar(state.avatar_storage.as_ref(), &key).await {
                 tracing::error!(%delete_error, avatar_key = %key, "Failed to remove orphaned group avatar");
             }
             return Err(error.into_api_error());
@@ -843,7 +1032,7 @@ async fn upload_group_avatar(
     if let Some(previous_key) = previous_avatar_key
         .as_deref()
         .filter(|previous| *previous != key.as_str())
-        && let Err(error) = state.avatar_storage.delete(previous_key).await
+        && let Err(error) = delete_avatar(state.avatar_storage.as_ref(), previous_key).await
     {
         tracing::warn!(%error, avatar_key = %previous_key, "Failed to remove replaced group avatar");
     }
@@ -1203,7 +1392,11 @@ async fn load_group_by_code(
     };
     conversations::table
         .filter(conversations::kind.eq("group"))
-        .filter(conversations::group_code.eq(code))
+        .filter(
+            conversations::group_code
+                .eq(&code)
+                .or(conversations::legacy_group_code.eq(&code)),
+        )
         .select(Conversation::as_select())
         .first(conn)
         .await
@@ -1215,7 +1408,7 @@ async fn load_group_by_code(
         })
 }
 
-async fn load_group_for_update(
+pub(super) async fn load_group_for_update(
     conn: &mut diesel_async::AsyncPgConnection,
     group_id: Uuid,
 ) -> Result<Conversation, (StatusCode, String)> {
@@ -1250,7 +1443,7 @@ async fn require_group_admin(
     Ok(group)
 }
 
-async fn require_group_admin_for_update(
+pub(super) async fn require_group_admin_for_update(
     conn: &mut diesel_async::AsyncPgConnection,
     group_id: Uuid,
     user_id: Uuid,
@@ -1271,7 +1464,7 @@ async fn require_group_admin_for_update(
     Ok((group, role))
 }
 
-async fn group_member_role(
+pub(super) async fn group_member_role(
     conn: &mut diesel_async::AsyncPgConnection,
     group_id: Uuid,
     user_id: Uuid,
@@ -1286,7 +1479,7 @@ async fn group_member_role(
         .map_err(internal_error)
 }
 
-async fn authorize_group_admission(
+pub(super) async fn authorize_group_admission(
     conn: &mut diesel_async::AsyncPgConnection,
     group: &Conversation,
     candidate_id: Uuid,
@@ -1302,15 +1495,8 @@ async fn authorize_group_admission(
                 Err((StatusCode::FORBIDDEN, "Invalid group password".to_string()))
             }
         }
-        GroupAccessPolicy::FriendsOnly => {
-            if is_friends_with_every_member(conn, group.id, candidate_id).await? {
-                Ok(())
-            } else {
-                Err((
-                    StatusCode::FORBIDDEN,
-                    "Friends-only groups require friendship with every member".to_string(),
-                ))
-            }
+        GroupAccessPolicy::FriendsOnly | GroupAccessPolicy::FriendsOfFriends => {
+            authorize_friendship_policy(conn, group, policy, candidate_id).await
         }
     }
 }
@@ -1320,15 +1506,64 @@ async fn authorize_admin_addition(
     group: &Conversation,
     candidate_id: Uuid,
 ) -> Result<(), (StatusCode, String)> {
-    if group_policy(group)? == GroupAccessPolicy::FriendsOnly
-        && !is_friends_with_every_member(conn, group.id, candidate_id).await?
-    {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Friends-only groups require friendship with every member".to_string(),
-        ));
+    match group_policy(group)? {
+        GroupAccessPolicy::Open => Ok(()),
+        GroupAccessPolicy::Password => Err((
+            StatusCode::CONFLICT,
+            "Password-protected groups require an invitation".to_string(),
+        )),
+        policy => authorize_friendship_policy(conn, group, policy, candidate_id).await,
     }
-    Ok(())
+}
+
+async fn authorize_friendship_policy(
+    conn: &mut diesel_async::AsyncPgConnection,
+    group: &Conversation,
+    policy: GroupAccessPolicy,
+    candidate_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    let (allowed, message) = match policy {
+        GroupAccessPolicy::FriendsOnly => (
+            is_friends_with_every_member(conn, group.id, candidate_id).await?,
+            "Friends-only groups require friendship with every member",
+        ),
+        GroupAccessPolicy::FriendsOfFriends => (
+            is_friends_with_any_member(conn, group.id, candidate_id).await?,
+            "Friends-of-friends groups require friendship with a member",
+        ),
+        GroupAccessPolicy::Open | GroupAccessPolicy::Password => return Ok(()),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, message.to_string()))
+    }
+}
+
+async fn is_friends_with_any_member(
+    conn: &mut diesel_async::AsyncPgConnection,
+    group_id: Uuid,
+    candidate_id: Uuid,
+) -> Result<bool, (StatusCode, String)> {
+    let member_ids = conversation_members::table
+        .filter(conversation_members::conversation_id.eq(group_id))
+        .filter(conversation_members::user_id.ne(candidate_id))
+        .select(conversation_members::user_id);
+    diesel::select(exists(
+        friendships::table
+            .filter(friendships::status.eq("accepted"))
+            .filter(
+                friendships::requester_id
+                    .eq(candidate_id)
+                    .and(friendships::addressee_id.eq_any(member_ids.clone()))
+                    .or(friendships::addressee_id
+                        .eq(candidate_id)
+                        .and(friendships::requester_id.eq_any(member_ids))),
+            ),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(internal_error)
 }
 
 async fn is_friends_with_every_member(
@@ -1447,7 +1682,7 @@ async fn revoke_and_close_sfu_rooms(state: &AppState, room_ids: &[String]) {
     }
 }
 
-async fn publish_group_update(
+pub(super) async fn publish_group_update(
     state: &AppState,
     conn: &mut diesel_async::AsyncPgConnection,
     group_id: Uuid,
@@ -1557,7 +1792,7 @@ fn canonical_user_pair(first: Uuid, second: Uuid) -> (Uuid, Uuid) {
     }
 }
 
-async fn add_member(
+pub(super) async fn add_member(
     conn: &mut diesel_async::AsyncPgConnection,
     group_id: Uuid,
     user_id: Uuid,
@@ -1591,7 +1826,7 @@ async fn touch_group(
     Ok(())
 }
 
-async fn ensure_user_exists(
+pub(super) async fn ensure_user_exists(
     conn: &mut diesel_async::AsyncPgConnection,
     user_id: Uuid,
 ) -> Result<(), (StatusCode, String)> {
@@ -1622,6 +1857,7 @@ async fn ensure_direct_conversation(
 
     diesel::insert_into(conversations::table)
         .values(NewConversation {
+            id: Uuid::new_v4(),
             kind: "direct".to_string(),
             creator_id: first_user_id,
             title: None,
@@ -1630,6 +1866,7 @@ async fn ensure_direct_conversation(
             direct_user_low_id: Some(low_id),
             direct_user_high_id: Some(high_id),
             group_code: None,
+            legacy_group_code: None,
             avatar_key: None,
         })
         .on_conflict((
@@ -1695,7 +1932,7 @@ async fn find_direct_conversation(
         .map_err(internal_error)
 }
 
-fn conversation_response(
+pub(super) fn conversation_response(
     conversation: &Conversation,
     current_user_id: Uuid,
     role: Option<String>,
@@ -1736,6 +1973,7 @@ fn conversation_response(
         other_user_id,
         message_count: 0,
         unread_count: 0,
+        marked_unread: false,
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
     })
@@ -1763,6 +2001,8 @@ struct ConversationMessageCounts {
     message_count: i64,
     #[diesel(sql_type = BigInt)]
     unread_count: i64,
+    #[diesel(sql_type = Bool)]
+    marked_unread: bool,
 }
 
 async fn message_counts_for_conversations(
@@ -1780,7 +2020,8 @@ async fn message_counts_for_conversations(
                 COUNT(*) FILTER (
                     WHERE messages.sender_id <> $1
                       AND messages.sequence > COALESCE(reads.last_read_sequence, 0)
-                )::BIGINT AS unread_count
+                )::BIGINT AS unread_count,
+                BOOL_OR(COALESCE(reads.marked_unread, FALSE)) AS marked_unread
          FROM conversation_messages AS messages
          LEFT JOIN conversation_read_states AS reads
            ON reads.conversation_id = messages.conversation_id AND reads.user_id = $1
@@ -1799,7 +2040,9 @@ async fn message_counts_for_conversations(
         .collect())
 }
 
-fn group_policy(group: &Conversation) -> Result<GroupAccessPolicy, (StatusCode, String)> {
+pub(super) fn group_policy(
+    group: &Conversation,
+) -> Result<GroupAccessPolicy, (StatusCode, String)> {
     group
         .access_policy
         .as_deref()
@@ -1807,34 +2050,37 @@ fn group_policy(group: &Conversation) -> Result<GroupAccessPolicy, (StatusCode, 
         .ok_or_else(|| internal_error("invalid group access policy"))
 }
 
-fn generate_group_code() -> String {
-    const ADJECTIVES: &[&str] = &[
-        "bright", "calm", "clear", "cool", "cozy", "fresh", "gentle", "golden", "green", "happy",
-        "kind", "lively", "mellow", "quiet", "rapid", "steady",
-    ];
-    const NOUNS: &[&str] = &[
-        "bay", "brook", "cove", "field", "forest", "harbor", "hill", "island", "lake", "meadow",
-        "ocean", "park", "river", "shore", "spring", "trail",
-    ];
+fn group_code_from_uuid(uuid: Uuid) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const LENGTH: usize = 22;
+    let mut remaining = *uuid.as_bytes();
+    let mut code = [b'0'; LENGTH];
 
-    let uuid = Uuid::new_v4();
-    let bytes = uuid.as_bytes();
-    let suffix = uuid.simple().to_string();
-    format!(
-        "{}-{}-{}",
-        ADJECTIVES[bytes[0] as usize % ADJECTIVES.len()],
-        NOUNS[bytes[1] as usize % NOUNS.len()],
-        &suffix[20..]
-    )
+    for character in code.iter_mut().rev() {
+        let mut remainder = 0u16;
+        for byte in &mut remaining {
+            let value = remainder * 256 + u16::from(*byte);
+            *byte = (value / 62) as u8;
+            remainder = value % 62;
+        }
+        *character = ALPHABET[remainder as usize];
+    }
+
+    String::from_utf8(code.to_vec()).expect("Base62 alphabet is valid UTF-8")
 }
 
 fn normalize_group_code(code: &str) -> Option<String> {
-    let code = code.trim().to_ascii_lowercase();
-    (code.len() <= 80
-        && code
+    let code = code.trim();
+    if code.len() == 22 && code.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Some(code.to_string());
+    }
+
+    let legacy_code = code.to_ascii_lowercase();
+    (legacy_code.len() <= 80
+        && legacy_code
             .split('-')
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric())))
-    .then_some(code)
+    .then_some(legacy_code)
 }
 
 fn validate_initial_member_ids(
@@ -1892,7 +2138,11 @@ fn can_delete_group(role: &str) -> bool {
 }
 
 fn can_view_group_info(policy: GroupAccessPolicy, is_member: bool) -> bool {
-    is_member || policy != GroupAccessPolicy::FriendsOnly
+    is_member
+        || matches!(
+            policy,
+            GroupAccessPolicy::Open | GroupAccessPolicy::Password
+        )
 }
 
 fn can_join_group(is_member: bool) -> bool {
@@ -1965,7 +2215,7 @@ async fn verify_group_password(
     .map_err(internal_error)?
 }
 
-fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+pub(super) fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     tracing::error!("Conversation API error: {error}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1977,7 +2227,7 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 mod tests {
     use super::{
         GroupAccessPolicy, can_delete_group, can_join_group, can_view_group_info,
-        generate_group_code, group_avatar_url_with_revision, normalize_group_code,
+        group_avatar_url_with_revision, group_code_from_uuid, normalize_group_code,
         required_initial_friendship_pairs, validate_group_title, validate_group_update_request,
         validate_initial_member_ids, validate_password_for_policy,
     };
@@ -1985,27 +2235,34 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn generates_normalized_group_codes_with_words_and_unique_suffix() {
-        let code = generate_group_code();
-        let parts = code.split('-').collect::<Vec<_>>();
+    fn generates_22_character_base62_group_ids() {
+        let code = group_code_from_uuid(Uuid::new_v4());
 
-        assert_eq!(parts.len(), 3);
-        assert!(parts[0].bytes().all(|byte| byte.is_ascii_lowercase()));
-        assert!(parts[1].bytes().all(|byte| byte.is_ascii_lowercase()));
-        assert_eq!(parts[2].len(), 12);
-        assert!(parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(code.len(), 22);
+        assert!(code.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn encodes_every_uuid_bit_into_the_group_id() {
+        let first = Uuid::parse_str("20000000-0000-4000-8000-000000000001").unwrap();
+        let second = Uuid::parse_str("20000000-0000-4000-8000-000000000002").unwrap();
+
+        assert_ne!(group_code_from_uuid(first), group_code_from_uuid(second));
     }
 
     #[test]
     fn normalizes_group_codes_for_lookup() {
+        assert_eq!(
+            normalize_group_code("  2aIFX0J6L4w7Y9KzQp8VrN  "),
+            Some("2aIFX0J6L4w7Y9KzQp8VrN".to_string())
+        );
         assert_eq!(
             normalize_group_code("  Calm-Harbor-123ABC  "),
             Some("calm-harbor-123abc".to_string())
         );
         assert_eq!(normalize_group_code("  "), None);
         assert_eq!(normalize_group_code(&"a".repeat(81)), None);
-        assert_eq!(normalize_group_code("calm--harbor"), None);
-        assert_eq!(normalize_group_code("calm_harbor"), None);
+        assert_eq!(normalize_group_code("2aIFX0J6L4w7Y9KzQp8Vr-"), None);
     }
 
     #[test]
@@ -2143,6 +2400,14 @@ mod tests {
         assert!(can_view_group_info(GroupAccessPolicy::Password, false));
         assert!(!can_view_group_info(GroupAccessPolicy::FriendsOnly, false));
         assert!(can_view_group_info(GroupAccessPolicy::FriendsOnly, true));
+        assert!(!can_view_group_info(
+            GroupAccessPolicy::FriendsOfFriends,
+            false
+        ));
+        assert!(can_view_group_info(
+            GroupAccessPolicy::FriendsOfFriends,
+            true
+        ));
     }
 
     #[test]

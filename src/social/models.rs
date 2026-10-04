@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use crate::schema::{
     call_invitations, call_session_members, call_sessions, conversation_members,
-    conversation_messages, conversations, direct_message_requests, friendships, meeting_history,
-    notifications, revoked_sfu_rooms, user_presence, users,
+    conversation_messages, conversations, direct_message_requests, friendships, group_invitations,
+    meeting_history, notifications, revoked_sfu_rooms, user_presence, users,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -15,6 +15,7 @@ pub enum GroupAccessPolicy {
     Open,
     Password,
     FriendsOnly,
+    FriendsOfFriends,
 }
 
 impl GroupAccessPolicy {
@@ -23,6 +24,7 @@ impl GroupAccessPolicy {
             Self::Open => "open",
             Self::Password => "password",
             Self::FriendsOnly => "friends_only",
+            Self::FriendsOfFriends => "friends_of_friends",
         }
     }
 
@@ -31,6 +33,7 @@ impl GroupAccessPolicy {
             "open" => Some(Self::Open),
             "password" => Some(Self::Password),
             "friends_only" => Some(Self::FriendsOnly),
+            "friends_of_friends" => Some(Self::FriendsOfFriends),
             _ => None,
         }
     }
@@ -66,6 +69,7 @@ pub struct Conversation {
     pub direct_user_low_id: Option<Uuid>,
     pub direct_user_high_id: Option<Uuid>,
     pub group_code: Option<String>,
+    pub legacy_group_code: Option<String>,
     pub avatar_key: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -74,6 +78,7 @@ pub struct Conversation {
 #[derive(Debug, Insertable)]
 #[diesel(table_name = conversations)]
 pub struct NewConversation {
+    pub id: Uuid,
     pub kind: String,
     pub creator_id: Uuid,
     pub title: Option<String>,
@@ -82,6 +87,7 @@ pub struct NewConversation {
     pub direct_user_low_id: Option<Uuid>,
     pub direct_user_high_id: Option<Uuid>,
     pub group_code: Option<String>,
+    pub legacy_group_code: Option<String>,
     pub avatar_key: Option<String>,
 }
 
@@ -284,7 +290,9 @@ pub struct UserPresence {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateFriendRequest {
-    pub email: String,
+    pub email: Option<String>,
+    /// Lets people who already see each other, such as group participants, connect without an email.
+    pub user_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,6 +418,7 @@ pub struct RespondToDirectMessageRequest {
 pub struct FriendSummary {
     pub id: Uuid,
     pub name: String,
+    pub nickname: String,
     pub email: String,
     pub avatar_url: Option<String>,
     pub is_online: bool,
@@ -570,6 +579,7 @@ pub struct ConversationResponse {
     pub other_user_id: Option<Uuid>,
     pub message_count: i64,
     pub unread_count: i64,
+    pub marked_unread: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -594,8 +604,91 @@ pub struct GroupInfoResponse {
 pub struct GroupMemberResponse {
     pub id: Uuid,
     pub name: String,
+    pub nickname: String,
+    pub avatar_url: Option<String>,
     pub role: String,
     pub joined_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMembersPage {
+    pub members: Vec<GroupMemberResponse>,
+    pub next_offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageQuery {
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupCandidatesQuery {
+    pub query: String,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupCandidate {
+    pub id: Uuid,
+    pub name: String,
+    pub nickname: String,
+    pub email: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupCandidatesPage {
+    pub results: Vec<GroupCandidate>,
+    pub next_offset: Option<i64>,
+}
+
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = group_invitations)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct GroupInvitation {
+    pub id: Uuid,
+    pub conversation_id: Uuid,
+    pub inviter_id: Uuid,
+    pub invitee_id: Uuid,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub responded_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = group_invitations)]
+pub struct NewGroupInvitation {
+    pub conversation_id: Uuid,
+    pub inviter_id: Uuid,
+    pub invitee_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGroupInvitationRequest {
+    pub user_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptGroupInvitationRequest {
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInvitationResponse {
+    pub id: Uuid,
+    pub group_id: Uuid,
+    pub group_title: String,
+    pub access_policy: GroupAccessPolicy,
+    pub inviter_id: Uuid,
+    pub inviter_name: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -605,6 +698,7 @@ pub struct ConversationMessageResponse {
     pub conversation_id: Uuid,
     pub sender_id: Uuid,
     pub sender_name: String,
+    pub sender_nickname: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
 }
