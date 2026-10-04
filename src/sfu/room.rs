@@ -1,6 +1,7 @@
 use crate::sfu::packet_buffer::RtpPacketBuffer;
 use crate::sfu::participant::ParticipantConnection;
 use crate::signaling::message::{ChatMessagePayload, SignalingMessage};
+use metrics::counter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, RwLock as StdRwLock,
@@ -22,8 +23,8 @@ use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
 use webrtc::track::track_remote::TrackRemote;
 
-/// Broadcast channel capacity for RTP packets
-const RTP_BROADCAST_CAPACITY: usize = 256;
+/// Six seconds of typical video RTP gives receiver writers time to recover from short scheduling stalls.
+const RTP_BROADCAST_CAPACITY: usize = 4096;
 const CHAT_HISTORY_CAPACITY: usize = 500;
 const ROOM_CHAT_RATE_LIMIT: usize = 50;
 const ROOM_CHAT_RATE_WINDOW: Duration = Duration::from_secs(5);
@@ -772,8 +773,10 @@ impl Room {
                                         break;
                                     }
                                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        counter!("sfu_rtp_forwarding_lagged_packets_total", "media_kind" => kind.to_string()).increment(n);
                                         warn!("Receiver {} lagged {} packets from {}", to_id, n, from_id);
-                                        // Continue - we'll catch up
+                                        // Skip stale media. The receiver's NACK/PLI path requests a fresh keyframe.
+                                        packet_rx = packet_rx.resubscribe();
                                     }
                                 }
                             }
@@ -904,7 +907,10 @@ impl Room {
                                 break;
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
+                                counter!("sfu_rtp_forwarding_lagged_packets_total", "media_kind" => kind.to_string()).increment(n);
                                 warn!("Late joiner {} lagged {} packets from {}", to_id, n, from_id);
+                                // Skip stale media. The receiver's NACK/PLI path requests a fresh keyframe.
+                                packet_rx = packet_rx.resubscribe();
                             }
                         }
                     }

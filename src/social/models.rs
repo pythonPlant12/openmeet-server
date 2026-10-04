@@ -66,6 +66,7 @@ pub struct Conversation {
     pub direct_user_low_id: Option<Uuid>,
     pub direct_user_high_id: Option<Uuid>,
     pub group_code: Option<String>,
+    pub legacy_group_code: Option<String>,
     pub avatar_key: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -74,6 +75,7 @@ pub struct Conversation {
 #[derive(Debug, Insertable)]
 #[diesel(table_name = conversations)]
 pub struct NewConversation {
+    pub id: Uuid,
     pub kind: String,
     pub creator_id: Uuid,
     pub title: Option<String>,
@@ -82,6 +84,7 @@ pub struct NewConversation {
     pub direct_user_low_id: Option<Uuid>,
     pub direct_user_high_id: Option<Uuid>,
     pub group_code: Option<String>,
+    pub legacy_group_code: Option<String>,
     pub avatar_key: Option<String>,
 }
 

@@ -208,7 +208,8 @@ async fn create_group(
     validate_password_for_policy(request.access_policy, request.password.as_deref())?;
     let member_ids = validate_initial_member_ids(user_id, request.member_ids)?;
     let password_hash = hash_group_password(request.password).await?;
-    let group_code = generate_group_code();
+    let group_id = Uuid::new_v4();
+    let group_code = group_code_from_uuid(group_id);
     let mut conn = state.pool.get().await.map_err(internal_error)?;
     let initial_member_ids = member_ids.clone();
     let access_policy = request.access_policy;
@@ -220,6 +221,7 @@ async fn create_group(
 
                 let conversation: Conversation = diesel::insert_into(conversations::table)
                     .values(NewConversation {
+                        id: group_id,
                         kind: "group".to_string(),
                         creator_id: user_id,
                         title: Some(title),
@@ -228,6 +230,7 @@ async fn create_group(
                         direct_user_low_id: None,
                         direct_user_high_id: None,
                         group_code: Some(group_code),
+                        legacy_group_code: None,
                         avatar_key: None,
                     })
                     .returning(Conversation::as_returning())
@@ -586,7 +589,6 @@ async fn remove_group_member(
 ) -> EmptyResult {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let replacement_code = generate_group_code();
     let room_ids = conn
         .transaction(|conn| {
             async move {
@@ -612,10 +614,7 @@ async fn remove_group_member(
                 }
                 let room_ids = revoke_group_call_memberships(conn, group_id, member_id).await?;
                 diesel::update(conversations::table.find(group_id))
-                    .set((
-                        conversations::group_code.eq(replacement_code),
-                        conversations::updated_at.eq(Utc::now()),
-                    ))
+                    .set(conversations::updated_at.eq(Utc::now()))
                     .execute(conn)
                     .await?;
                 Ok(room_ids)
@@ -1203,7 +1202,11 @@ async fn load_group_by_code(
     };
     conversations::table
         .filter(conversations::kind.eq("group"))
-        .filter(conversations::group_code.eq(code))
+        .filter(
+            conversations::group_code
+                .eq(&code)
+                .or(conversations::legacy_group_code.eq(&code)),
+        )
         .select(Conversation::as_select())
         .first(conn)
         .await
@@ -1622,6 +1625,7 @@ async fn ensure_direct_conversation(
 
     diesel::insert_into(conversations::table)
         .values(NewConversation {
+            id: Uuid::new_v4(),
             kind: "direct".to_string(),
             creator_id: first_user_id,
             title: None,
@@ -1630,6 +1634,7 @@ async fn ensure_direct_conversation(
             direct_user_low_id: Some(low_id),
             direct_user_high_id: Some(high_id),
             group_code: None,
+            legacy_group_code: None,
             avatar_key: None,
         })
         .on_conflict((
@@ -1807,34 +1812,37 @@ fn group_policy(group: &Conversation) -> Result<GroupAccessPolicy, (StatusCode, 
         .ok_or_else(|| internal_error("invalid group access policy"))
 }
 
-fn generate_group_code() -> String {
-    const ADJECTIVES: &[&str] = &[
-        "bright", "calm", "clear", "cool", "cozy", "fresh", "gentle", "golden", "green", "happy",
-        "kind", "lively", "mellow", "quiet", "rapid", "steady",
-    ];
-    const NOUNS: &[&str] = &[
-        "bay", "brook", "cove", "field", "forest", "harbor", "hill", "island", "lake", "meadow",
-        "ocean", "park", "river", "shore", "spring", "trail",
-    ];
+fn group_code_from_uuid(uuid: Uuid) -> String {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const LENGTH: usize = 22;
+    let mut remaining = *uuid.as_bytes();
+    let mut code = [b'0'; LENGTH];
 
-    let uuid = Uuid::new_v4();
-    let bytes = uuid.as_bytes();
-    let suffix = uuid.simple().to_string();
-    format!(
-        "{}-{}-{}",
-        ADJECTIVES[bytes[0] as usize % ADJECTIVES.len()],
-        NOUNS[bytes[1] as usize % NOUNS.len()],
-        &suffix[20..]
-    )
+    for character in code.iter_mut().rev() {
+        let mut remainder = 0u16;
+        for byte in &mut remaining {
+            let value = remainder * 256 + u16::from(*byte);
+            *byte = (value / 62) as u8;
+            remainder = value % 62;
+        }
+        *character = ALPHABET[remainder as usize];
+    }
+
+    String::from_utf8(code.to_vec()).expect("Base62 alphabet is valid UTF-8")
 }
 
 fn normalize_group_code(code: &str) -> Option<String> {
-    let code = code.trim().to_ascii_lowercase();
-    (code.len() <= 80
-        && code
+    let code = code.trim();
+    if code.len() == 22 && code.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Some(code.to_string());
+    }
+
+    let legacy_code = code.to_ascii_lowercase();
+    (legacy_code.len() <= 80
+        && legacy_code
             .split('-')
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric())))
-    .then_some(code)
+    .then_some(legacy_code)
 }
 
 fn validate_initial_member_ids(
@@ -1977,7 +1985,7 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 mod tests {
     use super::{
         GroupAccessPolicy, can_delete_group, can_join_group, can_view_group_info,
-        generate_group_code, group_avatar_url_with_revision, normalize_group_code,
+        group_avatar_url_with_revision, group_code_from_uuid, normalize_group_code,
         required_initial_friendship_pairs, validate_group_title, validate_group_update_request,
         validate_initial_member_ids, validate_password_for_policy,
     };
@@ -1985,27 +1993,34 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn generates_normalized_group_codes_with_words_and_unique_suffix() {
-        let code = generate_group_code();
-        let parts = code.split('-').collect::<Vec<_>>();
+    fn generates_22_character_base62_group_ids() {
+        let code = group_code_from_uuid(Uuid::new_v4());
 
-        assert_eq!(parts.len(), 3);
-        assert!(parts[0].bytes().all(|byte| byte.is_ascii_lowercase()));
-        assert!(parts[1].bytes().all(|byte| byte.is_ascii_lowercase()));
-        assert_eq!(parts[2].len(), 12);
-        assert!(parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(code.len(), 22);
+        assert!(code.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn encodes_every_uuid_bit_into_the_group_id() {
+        let first = Uuid::parse_str("20000000-0000-4000-8000-000000000001").unwrap();
+        let second = Uuid::parse_str("20000000-0000-4000-8000-000000000002").unwrap();
+
+        assert_ne!(group_code_from_uuid(first), group_code_from_uuid(second));
     }
 
     #[test]
     fn normalizes_group_codes_for_lookup() {
+        assert_eq!(
+            normalize_group_code("  2aIFX0J6L4w7Y9KzQp8VrN  "),
+            Some("2aIFX0J6L4w7Y9KzQp8VrN".to_string())
+        );
         assert_eq!(
             normalize_group_code("  Calm-Harbor-123ABC  "),
             Some("calm-harbor-123abc".to_string())
         );
         assert_eq!(normalize_group_code("  "), None);
         assert_eq!(normalize_group_code(&"a".repeat(81)), None);
-        assert_eq!(normalize_group_code("calm--harbor"), None);
-        assert_eq!(normalize_group_code("calm_harbor"), None);
+        assert_eq!(normalize_group_code("2aIFX0J6L4w7Y9KzQp8Vr-"), None);
     }
 
     #[test]

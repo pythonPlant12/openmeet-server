@@ -92,8 +92,10 @@ diesel::table! {
         password_hash -> Nullable<Varchar>,
         direct_user_low_id -> Nullable<Uuid>,
         direct_user_high_id -> Nullable<Uuid>,
-        #[max_length = 80]
+        #[max_length = 22]
         group_code -> Nullable<Varchar>,
+        #[max_length = 80]
+        legacy_group_code -> Nullable<Varchar>,
         #[max_length = 512]
         avatar_key -> Nullable<Varchar>,
         created_at -> Timestamptz,
