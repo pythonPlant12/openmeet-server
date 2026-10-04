@@ -413,6 +413,7 @@ pub struct RespondToDirectMessageRequest {
 pub struct FriendSummary {
     pub id: Uuid,
     pub name: String,
+    pub nickname: String,
     pub email: String,
     pub avatar_url: Option<String>,
     pub is_online: bool,
@@ -608,6 +609,7 @@ pub struct ConversationMessageResponse {
     pub conversation_id: Uuid,
     pub sender_id: Uuid,
     pub sender_name: String,
+    pub sender_nickname: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
 }

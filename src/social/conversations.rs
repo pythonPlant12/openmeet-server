@@ -33,6 +33,7 @@ use crate::{
     social::{
         SocialResource,
         handlers::{MAX_AVATAR_UPLOAD_BYTES, parse_avatar_upload, storage_error},
+        has_matching_if_none_match,
         messages::{create_message, list_messages},
         models::{
             AddConversationMemberRequest, Conversation, ConversationKind, ConversationMember,
@@ -88,6 +89,7 @@ pub fn conversation_routes() -> Router<AppState> {
             "/groups/{id}/avatar",
             get(get_group_avatar)
                 .post(upload_group_avatar)
+                .delete(remove_group_avatar)
                 .layer(DefaultBodyLimit::max(MAX_AVATAR_UPLOAD_BYTES)),
         )
         .route(
@@ -764,6 +766,18 @@ async fn get_group_avatar(
     let avatar_key = group
         .avatar_key
         .ok_or((StatusCode::NOT_FOUND, "Avatar not found".to_string()))?;
+    let etag = format!("\"{avatar_key}\"");
+    if has_matching_if_none_match(&headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(
+                header::CACHE_CONTROL,
+                "private, no-cache, max-age=0, must-revalidate",
+            )
+            .body(Body::empty())
+            .map_err(internal_error);
+    }
     let avatar = state
         .avatar_storage
         .download(&avatar_key)
@@ -773,9 +787,49 @@ async fn get_group_avatar(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, avatar.content_type)
-        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::ETAG, etag)
+        .header(
+            header::CACHE_CONTROL,
+            "private, no-cache, max-age=0, must-revalidate",
+        )
         .body(Body::from(avatar.bytes))
         .map_err(internal_error)
+}
+
+async fn remove_group_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+) -> EmptyResult {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let avatar_key = conn
+        .transaction(|conn| {
+            async move {
+                let (group, _) = require_group_admin_for_update(conn, group_id, user_id).await?;
+                let Some(avatar_key) = group.avatar_key else {
+                    return Ok(None);
+                };
+                diesel::update(conversations::table.find(group_id))
+                    .set((
+                        conversations::avatar_key.eq(None::<String>),
+                        conversations::updated_at.eq(Utc::now()),
+                    ))
+                    .execute(conn)
+                    .await?;
+                Ok(Some(avatar_key))
+            }
+            .scope_boxed()
+        })
+        .await
+        .map_err(ConversationError::into_api_error)?;
+    if let Some(avatar_key) = avatar_key {
+        if let Err(error) = state.avatar_storage.delete(&avatar_key).await {
+            tracing::warn!(%error, %group_id, %avatar_key, "Failed to remove deleted group avatar");
+        }
+        publish_group_update(&state, &mut conn, group_id, &[]).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn upload_group_avatar(

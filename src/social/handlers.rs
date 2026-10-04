@@ -22,7 +22,7 @@ use crate::{
     auth::{extract_user_id, models::User},
     schema::{call_invitations, friendships, meeting_history, notifications, user_presence, users},
     social::{
-        SocialResource, conversation_routes, create_notification,
+        SocialResource, conversation_routes, create_notification, has_matching_if_none_match,
         models::{
             CallInvitation, CallInvitationResponse, CreateCallRequest, CreateFriendRequest,
             FriendRequestItem, FriendSummary, FriendsResponse, Friendship, MeetingHistory,
@@ -60,7 +60,9 @@ pub fn social_routes() -> Router<AppState> {
         )
         .route(
             "/me/profile/avatar",
-            post(upload_avatar).layer(DefaultBodyLimit::max(MAX_AVATAR_UPLOAD_BYTES)),
+            post(upload_avatar)
+                .delete(remove_avatar)
+                .layer(DefaultBodyLimit::max(MAX_AVATAR_UPLOAD_BYTES)),
         )
         .route("/presence", post(update_presence))
         .route("/events", get(crate::social::social_events_handler))
@@ -156,6 +158,18 @@ pub async fn get_user_avatar(
         .await
         .map_err(user_not_found)?
         .ok_or((StatusCode::NOT_FOUND, "Avatar not found".to_string()))?;
+    let etag = format!("\"{avatar_key}\"");
+    if has_matching_if_none_match(&headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(
+                header::CACHE_CONTROL,
+                "private, no-cache, max-age=0, must-revalidate",
+            )
+            .body(Body::empty())
+            .map_err(internal_error);
+    }
     let avatar = state
         .avatar_storage
         .download(&avatar_key)
@@ -165,7 +179,11 @@ pub async fn get_user_avatar(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, avatar.content_type)
-        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::ETAG, etag)
+        .header(
+            header::CACHE_CONTROL,
+            "private, no-cache, max-age=0, must-revalidate",
+        )
         .body(Body::from(avatar.bytes))
         .map_err(internal_error)
 }
@@ -308,6 +326,40 @@ pub async fn upload_avatar(
     Ok(Json(profile_response(user, None)?))
 }
 
+async fn remove_avatar(State(state): State<AppState>, headers: HeaderMap) -> EmptyResult {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let avatar_key = users::table
+        .filter(users::id.eq(user_id))
+        .select(users::avatar_key)
+        .first::<Option<String>>(&mut conn)
+        .await
+        .map_err(user_not_found)?;
+    let Some(avatar_key) = avatar_key else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    let cleared = diesel::update(
+        users::table
+            .filter(users::id.eq(user_id))
+            .filter(users::avatar_key.eq(Some(&avatar_key))),
+    )
+    .set((
+        users::avatar_key.eq(None::<String>),
+        users::updated_at.eq(Utc::now().naive_utc()),
+    ))
+    .execute(&mut conn)
+    .await
+    .map_err(internal_error)?;
+    if cleared == 0 {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if let Err(error) = state.avatar_storage.delete(&avatar_key).await {
+        tracing::warn!(%error, %user_id, %avatar_key, "Failed to remove deleted avatar");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_friends(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -366,6 +418,7 @@ pub async fn list_friends(
             let summary = FriendSummary {
                 id: user.id,
                 name: user.name,
+                nickname: user.nickname,
                 email: user.email,
                 avatar_url,
                 is_online: presence_by_user.get(&user.id).copied().unwrap_or(false),
@@ -877,6 +930,7 @@ pub async fn list_incoming_calls(
             let summary = FriendSummary {
                 id: user.id,
                 name: user.name,
+                nickname: user.nickname,
                 email: user.email,
                 avatar_url,
                 is_online: presence_by_user.get(&user.id).copied().unwrap_or(false),
