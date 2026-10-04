@@ -50,6 +50,7 @@ use crate::{
             OpenDirectConversationResponse, PageQuery, RespondToDirectMessageRequest,
             UpdateConversationMemberRoleRequest, UpdateGroupPolicyRequest, UpdateGroupRequest,
         },
+        presence,
     },
 };
 
@@ -412,6 +413,10 @@ async fn list_group_members(
         .await
         .map_err(internal_error)?;
     let next_offset = next_page_offset(&mut members, offset);
+    let member_ids = members.iter().map(|member| member.0).collect::<Vec<_>>();
+    let online_ids = presence::visible_online_group_members(&mut conn, user_id, &member_ids)
+        .await
+        .map_err(internal_error)?;
 
     Ok(Json(GroupMembersPage {
         members: members
@@ -422,6 +427,7 @@ async fn list_group_members(
                     name,
                     nickname,
                     avatar_url: avatar_key.map(|key| user_avatar_url(id, &key)),
+                    is_online: online_ids.contains(&id),
                     role,
                     joined_at,
                 },

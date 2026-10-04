@@ -7,6 +7,7 @@ mod handlers;
 mod messages;
 mod models;
 mod notifications;
+mod presence;
 
 use axum::http::{HeaderMap, header};
 

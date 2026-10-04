@@ -35,6 +35,7 @@ use crate::{
             UserDiscovery, UserPresence, UserProfile, UserStatus,
         },
         notification_routes,
+        presence::{self, Relationship},
     },
 };
 
@@ -131,13 +132,19 @@ pub async fn get_user_profile(
             }
             _ => internal_error(error),
         })?;
+    // Profiles are limited to friends and the user themselves; hidden presence also hides last seen.
+    let relationship = Relationship {
+        is_self: user_id == target_user_id,
+        ..Relationship::FRIEND
+    };
     let last_seen_at = user_presence::table
         .filter(user_presence::user_id.eq(target_user_id))
         .select(user_presence::last_seen_at)
         .first::<DateTime<Utc>>(&mut conn)
         .await
         .optional()
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+        .filter(|_| presence::can_see(presence::visibility_for(target_user_id), relationship));
     Ok(Json(profile_response(user, last_seen_at)?))
 }
 
@@ -385,10 +392,19 @@ pub async fn list_friends(
         .load(&mut conn)
         .await
         .map_err(internal_error)?;
-    let online_after = Utc::now() - Duration::seconds(45);
+    // Friends and callers here are accepted friends of the viewer.
     let presence_by_user: HashMap<Uuid, bool> = presence
         .into_iter()
-        .map(|entry| (entry.user_id, entry.last_seen_at > online_after))
+        .map(|entry| {
+            (
+                entry.user_id,
+                presence::is_visibly_online(
+                    entry.user_id,
+                    entry.last_seen_at,
+                    Relationship::FRIEND,
+                ),
+            )
+        })
         .collect();
     let users_by_id: HashMap<Uuid, FriendSummary> = related_users
         .into_iter()
@@ -908,10 +924,19 @@ pub async fn list_incoming_calls(
         .load(&mut conn)
         .await
         .map_err(internal_error)?;
-    let online_after = Utc::now() - Duration::seconds(45);
+    // Friends and callers here are accepted friends of the viewer.
     let presence_by_user: HashMap<Uuid, bool> = presence
         .into_iter()
-        .map(|entry| (entry.user_id, entry.last_seen_at > online_after))
+        .map(|entry| {
+            (
+                entry.user_id,
+                presence::is_visibly_online(
+                    entry.user_id,
+                    entry.last_seen_at,
+                    Relationship::FRIEND,
+                ),
+            )
+        })
         .collect();
     let callers_by_id: HashMap<Uuid, FriendSummary> = callers
         .into_iter()
@@ -1116,8 +1141,6 @@ fn profile_response(
             "Profile unavailable".to_string(),
         )
     })?;
-    let online_after = Utc::now() - Duration::seconds(45);
-
     Ok(UserProfile {
         id: user.id,
         name: user.name,
@@ -1130,9 +1153,7 @@ fn profile_response(
         status,
         status_message: user.status_message,
         created_at: user.created_at,
-        is_online: last_seen_at
-            .as_ref()
-            .is_some_and(|last_seen_at| *last_seen_at > online_after),
+        is_online: last_seen_at.is_some_and(presence::is_recent),
         last_seen_at,
     })
 }
