@@ -870,6 +870,8 @@ async fn handle_message(
                                                     Arc::clone(&room.pending_negotiated_tracks);
                                                 let forwarded_tracks_ref =
                                                     Arc::clone(&room.forwarded_tracks);
+                                                let forwarded_senders_ref =
+                                                    Arc::clone(&room.forwarded_senders);
                                                 let room_lock_for_renego = Arc::clone(&room_lock);
                                                 let session_user_id_for_renego = session_user_id;
 
@@ -984,7 +986,7 @@ async fn handle_message(
                                                             }
 
                                                             match Room::create_forwarding_track(
-                                                                &track,
+                                                                &track, &sender_id,
                                                             )
                                                             .await
                                                             {
@@ -1018,6 +1020,13 @@ async fn handle_message(
                                                                                 sender_ssrc,
                                                                                 local_ssrc
                                                                             );
+                                                                            Room::record_forwarded_sender(
+                                                                                &forwarded_senders_ref,
+                                                                                &participant_id_for_renego,
+                                                                                &sender_id,
+                                                                                Arc::clone(&rtp_sender),
+                                                                            )
+                                                                            .await;
                                                                             pending_forwards
                                                                                 .push((
                                                                                 Arc::clone(&track),

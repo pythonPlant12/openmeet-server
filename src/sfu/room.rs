@@ -1,5 +1,6 @@
 use crate::sfu::packet_buffer::RtpPacketBuffer;
 use crate::sfu::participant::ParticipantConnection;
+use crate::sfu::peer_connection::SfuPeerConnection;
 use crate::signaling::message::{ChatMessagePayload, SignalingMessage};
 use metrics::counter;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -8,8 +9,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use sysinfo::{Pid, System};
-use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -63,6 +64,11 @@ impl Drop for SenderTrackInfo {
     }
 }
 
+/// Receiver participant ID -> (source participant ID, sender) for each forwarded track.
+pub type ForwardedSenders = Arc<RwLock<HashMap<String, Vec<(String, Arc<RTCRtpSender>)>>>>;
+
+const RETIRE_OFFER_ATTEMPTS: u64 = 5;
+
 /// A video conference room containing multiple participants
 pub struct Room {
     pub id: String,
@@ -80,6 +86,11 @@ pub struct Room {
     /// Track IDs that have an RTP forwarding subscription to each participant.
     /// This is separate from negotiation state so retries cannot add duplicate writers.
     pub forwarded_tracks: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// RTP senders forwarding media into each receiver's peer connection, tagged with the source
+    /// participant. A source that leaves must have its senders removed from every receiver, otherwise
+    /// the stale m-sections keep their msid and a rejoin with the same tracks produces duplicate
+    /// a=msid lines that browsers reject.
+    pub forwarded_senders: ForwardedSenders,
     chat_history: VecDeque<ChatMessagePayload>,
     recent_chat_messages: VecDeque<Instant>,
 }
@@ -96,6 +107,7 @@ impl Room {
             negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
             pending_negotiated_tracks: Arc::new(RwLock::new(HashMap::new())),
             forwarded_tracks: Arc::new(RwLock::new(HashMap::new())),
+            forwarded_senders: Arc::new(RwLock::new(HashMap::new())),
             chat_history: VecDeque::with_capacity(CHAT_HISTORY_CAPACITY),
             recent_chat_messages: VecDeque::with_capacity(ROOM_CHAT_RATE_LIMIT),
         }
@@ -240,6 +252,7 @@ impl Room {
                     tracks.retain(|track_id| !removed_track_ids.contains(track_id));
                 }
             }
+            self.retire_senders_from(participant_id).await;
 
             // Notify all remaining participants
             self.broadcast(SignalingMessage::ParticipantLeft {
@@ -262,6 +275,133 @@ impl Room {
                 participant_id
             );
         }
+    }
+
+    pub async fn record_forwarded_sender(
+        forwarded_senders: &ForwardedSenders,
+        receiver_id: &str,
+        source_id: &str,
+        sender: Arc<RTCRtpSender>,
+    ) {
+        forwarded_senders
+            .write()
+            .await
+            .entry(receiver_id.to_string())
+            .or_default()
+            .push((source_id.to_string(), sender));
+    }
+
+    /// Detach a departed participant's forwarded senders from every remaining receiver. The WebRTC
+    /// work runs in spawned tasks so the room lock is not held across track removal and renegotiation.
+    async fn retire_senders_from(&self, source_id: &str) {
+        let stale = {
+            let mut senders = self.forwarded_senders.write().await;
+            senders.remove(source_id);
+            senders
+                .iter_mut()
+                .filter_map(|(receiver_id, entries)| {
+                    let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(entries)
+                        .into_iter()
+                        .partition(|(source, _)| source == source_id);
+                    *entries = kept;
+                    (!gone.is_empty()).then(|| {
+                        let senders = gone
+                            .into_iter()
+                            .map(|(_, sender)| sender)
+                            .collect::<Vec<_>>();
+                        (receiver_id.clone(), senders)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (receiver_id, senders) in stale {
+            let Some(receiver) = self.participants.get(&receiver_id) else {
+                continue;
+            };
+            let Some(peer_conn) = receiver.get_peer_connection() else {
+                continue;
+            };
+            let signaling = receiver.sender.clone();
+            tokio::spawn(Self::retire_forwarded_senders(
+                peer_conn,
+                signaling,
+                receiver_id,
+                senders,
+            ));
+        }
+    }
+
+    async fn retire_forwarded_senders(
+        peer_conn: Arc<Mutex<SfuPeerConnection>>,
+        signaling: mpsc::UnboundedSender<SignalingMessage>,
+        receiver_id: String,
+        senders: Vec<Arc<RTCRtpSender>>,
+    ) {
+        {
+            let peer_conn_lock = peer_conn.lock().await;
+            let pc = peer_conn_lock.get_peer_connection();
+            for transceiver in pc.get_transceivers().await {
+                let sender = transceiver.sender().await;
+                if !senders.iter().any(|retired| Arc::ptr_eq(retired, &sender)) {
+                    continue;
+                }
+                if let Err(e) = pc.remove_track(&sender).await {
+                    warn!(
+                        "Failed to remove departed track from {}: {}",
+                        receiver_id, e
+                    );
+                }
+                // add_track reuses a live transceiver whose original track ID matches, and a stopped sender
+                // cannot bind a new track. Stopping the transceiver rejects its m-line, so a rejoin with
+                // the same tracks gets a fresh transceiver.
+                if let Err(e) = transceiver.stop().await {
+                    warn!(
+                        "Failed to stop departed transceiver for {}: {}",
+                        receiver_id, e
+                    );
+                }
+            }
+        }
+
+        // Tell the receiver its m-sections went inactive; retry while another negotiation is in flight.
+        for attempt in 1..=RETIRE_OFFER_ATTEMPTS {
+            let result = peer_conn.lock().await.create_offer_if_stable().await;
+            match result {
+                Ok(Some(offer)) => {
+                    if let Err(e) = signaling.send(SignalingMessage::Offer {
+                        target_id: receiver_id.clone(),
+                        sdp: offer.sdp,
+                    }) {
+                        warn!(
+                            "Failed to queue track-removal offer to {}: {}",
+                            receiver_id, e
+                        );
+                    } else {
+                        info!(
+                            "Sent track-removal offer to {} ({} tracks)",
+                            receiver_id,
+                            senders.len()
+                        );
+                    }
+                    return;
+                }
+                Ok(None) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+                }
+                Err(e) => {
+                    error!(
+                        "Track-removal renegotiation failed for {}: {}",
+                        receiver_id, e
+                    );
+                    return;
+                }
+            }
+        }
+        warn!(
+            "Gave up sending track-removal offer to {} after collision retries",
+            receiver_id
+        );
     }
 
     /// Get participant count
@@ -511,7 +651,7 @@ impl Room {
                 let peer_conn_lock = peer_conn.lock().await;
                 let pc = peer_conn_lock.get_peer_connection();
 
-                match Self::create_forwarding_track(&track).await {
+                match Self::create_forwarding_track(&track, sender_id).await {
                     Ok(local_track) => {
                         match pc.add_track(Arc::clone(&local_track) as Arc<dyn TrackLocal + Send + Sync>).await {
                             Ok(rtp_sender) => {
@@ -534,6 +674,13 @@ impl Room {
                                     participant_id
                                 );
 
+                                Self::record_forwarded_sender(
+                                    &self.forwarded_senders,
+                                    participant_id,
+                                    sender_id,
+                                    Arc::clone(&rtp_sender),
+                                )
+                                .await;
                                 receivers.push((participant_id.clone(), local_track, rtp_sender, local_ssrc, shutdown_rx.clone()));
 
                                 // Send PLI for video tracks to ensure immediate keyframe delivery
@@ -795,12 +942,17 @@ impl Room {
     /// Create a local track for forwarding a remote track
     pub async fn create_forwarding_track(
         remote_track: &Arc<TrackRemote>,
+        source_participant_id: &str,
     ) -> Result<Arc<TrackLocalStaticRTP>, String> {
         let codec = remote_track.codec();
+        // A participant who rejoins with the same camera keeps its track IDs, and departed m-sections keep
+        // their msid, so the source session is part of the ID to avoid duplicate a=msid lines. The prefix
+        // keeps the ID within the 64-character msid limit.
+        let source_tag = &source_participant_id[..source_participant_id.len().min(8)];
 
         let local_track = TrackLocalStaticRTP::new(
             codec.capability,
-            format!("forwarded-{}", remote_track.id()),
+            format!("forwarded-{}-{}", source_tag, remote_track.id()),
             remote_track.stream_id(),
         );
 
