@@ -64,3 +64,8 @@ sysinfo = "0.38.4"
 
 # Memory allocator - returns memory to OS aggressively
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
+# webrtc-ice 0.17 drops ICE role-conflict checks instead of resolving them (RFC 8445 §7.3.1.1), which
+# fails calls once current Chrome and the SFU disagree on roles. vendor/webrtc-ice carries that fix.
+[patch.crates-io]
+webrtc-ice = { path = "vendor/webrtc-ice" }

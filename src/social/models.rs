@@ -119,6 +119,7 @@ pub struct ConversationMessage {
     pub sender_name: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    pub reply_to_sequence: Option<i64>,
 }
 
 #[derive(Debug, Insertable)]
@@ -128,6 +129,7 @@ pub struct NewConversationMessage {
     pub sender_id: Uuid,
     pub sender_name: String,
     pub content: String,
+    pub reply_to_sequence: Option<i64>,
 }
 
 #[derive(Debug, Queryable, Selectable)]
@@ -375,8 +377,16 @@ pub struct JoinGroupByCodeRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateConversationMessageRequest {
     pub content: String,
+    /// Quotes an earlier message of the same conversation.
+    pub reply_to_sequence: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToggleMessageReactionRequest {
+    pub emoji: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,18 +432,39 @@ pub struct FriendSummary {
     pub email: String,
     pub avatar_url: Option<String>,
     pub is_online: bool,
+    /// Hidden (`null`) unless the viewer may see this user's status.
+    pub status: Option<UserStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub friendship_id: Option<Uuid>,
 }
 
-#[derive(Debug, Queryable, Selectable, Serialize)]
+#[derive(Debug, Queryable, Selectable)]
 #[diesel(table_name = users)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-#[serde(rename_all = "camelCase")]
 pub struct UserDiscovery {
     pub id: Uuid,
     pub name: String,
-    pub email: String,
+    pub nickname: String,
+    pub avatar_key: Option<String>,
+}
+
+/// People search exposes public identity only; emails stay private.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserDiscoveryResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub nickname: String,
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProfileRelationship {
+    Owner,
+    Friend,
+    /// Not friends: only public fields are filled in.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -442,6 +473,8 @@ pub enum UserStatus {
     Available,
     Away,
     DoNotDisturb,
+    Sleeping,
+    /// Appear offline: other people never see this user as online.
     Offline,
 }
 
@@ -451,6 +484,7 @@ impl UserStatus {
             Self::Available => "available",
             Self::Away => "away",
             Self::DoNotDisturb => "do_not_disturb",
+            Self::Sleeping => "sleeping",
             Self::Offline => "offline",
         }
     }
@@ -460,6 +494,7 @@ impl UserStatus {
             "available" => Some(Self::Available),
             "away" => Some(Self::Away),
             "do_not_disturb" => Some(Self::DoNotDisturb),
+            "sleeping" => Some(Self::Sleeping),
             "offline" => Some(Self::Offline),
             _ => None,
         }
@@ -479,6 +514,7 @@ pub struct UserProfile {
     pub created_at: NaiveDateTime,
     pub last_seen_at: Option<DateTime<Utc>>,
     pub is_online: bool,
+    pub relationship: ProfileRelationship,
 }
 
 #[derive(Debug, Deserialize)]
@@ -607,6 +643,8 @@ pub struct GroupMemberResponse {
     pub nickname: String,
     pub avatar_url: Option<String>,
     pub is_online: bool,
+    /// Hidden (`null`) unless the viewer may see this member's status.
+    pub status: Option<UserStatus>,
     pub role: String,
     pub joined_at: DateTime<Utc>,
 }
@@ -637,7 +675,6 @@ pub struct GroupCandidate {
     pub id: Uuid,
     pub name: String,
     pub nickname: String,
-    pub email: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -702,6 +739,27 @@ pub struct ConversationMessageResponse {
     pub sender_nickname: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    pub reply_to: Option<MessageReplyPreview>,
+    pub reactions: Vec<MessageReactionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReplyPreview {
+    pub sequence: i64,
+    pub sender_id: Uuid,
+    pub sender_name: String,
+    pub sender_nickname: String,
+    /// A short excerpt; the full quoted message stays in the conversation history.
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReactionSummary {
+    pub emoji: String,
+    pub count: i64,
+    pub reacted_by_me: bool,
 }
 
 #[derive(Debug, Serialize)]

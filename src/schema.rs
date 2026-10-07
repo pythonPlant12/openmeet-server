@@ -58,6 +58,17 @@ diesel::table! {
         sender_name -> Varchar,
         content -> Text,
         created_at -> Timestamptz,
+        reply_to_sequence -> Nullable<Int8>,
+    }
+}
+
+diesel::table! {
+    message_reactions (message_sequence, user_id, emoji) {
+        message_sequence -> Int8,
+        user_id -> Uuid,
+        #[max_length = 32]
+        emoji -> Varchar,
+        created_at -> Timestamptz,
     }
 }
 
@@ -227,6 +238,7 @@ diesel::joinable!(conversation_read_states -> users (user_id));
 diesel::joinable!(call_session_members -> call_sessions (call_session_id));
 diesel::joinable!(call_sessions -> conversations (conversation_id));
 diesel::joinable!(group_invitations -> conversations (conversation_id));
+diesel::joinable!(message_reactions -> conversation_messages (message_sequence));
 
 diesel::allow_tables_to_appear_in_same_query!(
     call_invitations,
@@ -241,6 +253,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     friendships,
     group_invitations,
     meeting_history,
+    message_reactions,
     notifications,
     refresh_tokens,
     revoked_sfu_rooms,

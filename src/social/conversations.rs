@@ -39,6 +39,7 @@ use crate::{
         },
         messages::{
             create_message, list_messages, mark_conversation_read, mark_conversation_unread,
+            toggle_message_reaction,
         },
         models::{
             AddConversationMemberRequest, Conversation, ConversationKind, ConversationMember,
@@ -49,6 +50,7 @@ use crate::{
             NewConversationMember, NewDirectMessageRequest, NewRevokedSfuRoom,
             OpenDirectConversationResponse, PageQuery, RespondToDirectMessageRequest,
             UpdateConversationMemberRoleRequest, UpdateGroupPolicyRequest, UpdateGroupRequest,
+            UserStatus,
         },
         presence,
     },
@@ -138,6 +140,10 @@ pub fn conversation_routes() -> Router<AppState> {
             post(respond_to_direct_message_request),
         )
         .route("/{id}/messages", get(list_messages).post(create_message))
+        .route(
+            "/{id}/messages/{sequence}/reactions",
+            post(toggle_message_reaction),
+        )
         .route("/{id}/read", post(mark_conversation_read))
         .route("/{id}/unread", post(mark_conversation_unread))
         .route("/{id}", delete(hide_direct_conversation))
@@ -394,6 +400,7 @@ async fn list_group_members(
         String,
         Option<String>,
         String,
+        String,
         chrono::DateTime<Utc>,
     )> = conversation_members::table
         .inner_join(users::table.on(users::id.eq(conversation_members::user_id)))
@@ -404,6 +411,7 @@ async fn list_group_members(
             users::name,
             users::nickname,
             users::avatar_key,
+            users::status,
             conversation_members::role,
             conversation_members::joined_at,
         ))
@@ -413,21 +421,28 @@ async fn list_group_members(
         .await
         .map_err(internal_error)?;
     let next_offset = next_page_offset(&mut members, offset);
-    let member_ids = members.iter().map(|member| member.0).collect::<Vec<_>>();
-    let online_ids = presence::visible_online_group_members(&mut conn, user_id, &member_ids)
-        .await
-        .map_err(internal_error)?;
+    let member_statuses = members
+        .iter()
+        .filter_map(|member| UserStatus::from_db_value(&member.4).map(|status| (member.0, status)))
+        .collect::<Vec<_>>();
+    let presence_by_member =
+        presence::visible_group_member_presence(&mut conn, user_id, &member_statuses)
+            .await
+            .map_err(internal_error)?;
 
     Ok(Json(GroupMembersPage {
         members: members
             .into_iter()
             .map(
-                |(id, name, nickname, avatar_key, role, joined_at)| GroupMemberResponse {
+                |(id, name, nickname, avatar_key, _, role, joined_at)| GroupMemberResponse {
                     id,
                     name,
                     nickname,
                     avatar_url: avatar_key.map(|key| user_avatar_url(id, &key)),
-                    is_online: online_ids.contains(&id),
+                    is_online: presence_by_member
+                        .get(&id)
+                        .is_some_and(|presence| presence.is_online),
+                    status: presence_by_member.get(&id).map(|presence| presence.status),
                     role,
                     joined_at,
                 },
@@ -455,7 +470,7 @@ async fn list_group_candidates(
     let policy = group_policy(&group)?;
 
     let mut candidates: Vec<GroupCandidateRow> = sql_query(
-        "SELECT candidate.id, candidate.name, candidate.nickname, candidate.email
+        "SELECT candidate.id, candidate.name, candidate.nickname
          FROM users AS candidate
          WHERE candidate.id <> $1
            AND NOT EXISTS (
@@ -508,7 +523,6 @@ async fn list_group_candidates(
                 id: candidate.id,
                 name: candidate.name,
                 nickname: candidate.nickname,
-                email: candidate.email,
             })
             .collect(),
         next_offset,
@@ -523,8 +537,6 @@ struct GroupCandidateRow {
     name: String,
     #[diesel(sql_type = Text)]
     nickname: String,
-    #[diesel(sql_type = Text)]
-    email: String,
 }
 
 fn validated_page_offset(offset: Option<i64>) -> Result<i64, (StatusCode, String)> {
