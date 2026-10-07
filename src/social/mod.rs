@@ -1,4 +1,5 @@
 mod avatars;
+mod badges;
 mod call_sessions;
 mod conversations;
 mod events;

@@ -20,8 +20,9 @@ use crate::{
     AppState,
     auth::extract_user_id,
     db::DbPool,
-    schema::{call_sessions, meeting_participants, meeting_sessions, users},
+    schema::{call_session_members, call_sessions, meeting_participants, meeting_sessions, users},
     social::{
+        SocialEventHub, SocialResource,
         avatars::user_avatar_url,
         handlers::is_valid_room_id,
         meeting_rooms::room_policies,
@@ -69,9 +70,9 @@ pub struct MeetingRecorder {
 }
 
 impl MeetingRecorder {
-    pub fn start(pool: DbPool) -> Self {
+    pub fn start(pool: DbPool, social_events: SocialEventHub) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
-        tokio::spawn(run_recorder(pool, receiver));
+        tokio::spawn(run_recorder(pool, social_events, receiver));
         Self { sender }
     }
 
@@ -111,7 +112,11 @@ struct LiveMeeting {
     participant_ids: HashSet<String>,
 }
 
-async fn run_recorder(pool: DbPool, mut events: mpsc::UnboundedReceiver<MeetingEvent>) {
+async fn run_recorder(
+    pool: DbPool,
+    social_events: SocialEventHub,
+    mut events: mpsc::UnboundedReceiver<MeetingEvent>,
+) {
     // Rooms live in memory, so sessions a previous process left open can never receive their leaves.
     if let Err(error) = close_abandoned_sessions(&pool).await {
         tracing::warn!(%error, "Failed to close abandoned meeting sessions");
@@ -139,7 +144,7 @@ async fn run_recorder(pool: DbPool, mut events: mpsc::UnboundedReceiver<MeetingE
                 .await
             }
             MeetingEvent::Left { participant_id, at } => {
-                record_leave(&pool, &mut live, &participant_id, at).await
+                record_leave(&pool, &social_events, &mut live, &participant_id, at).await
             }
         };
         if let Err(error) = result {
@@ -240,6 +245,7 @@ async fn record_join(
 
 async fn record_leave(
     pool: &DbPool,
+    social_events: &SocialEventHub,
     live: &mut LiveMeetings,
     participant_id: &str,
     at: DateTime<Utc>,
@@ -276,7 +282,25 @@ async fn record_leave(
         .set(meeting_sessions::ended_at.eq(at))
         .execute(&mut conn)
         .await?;
+        notify_call_members(&mut conn, social_events, &room_id).await?;
     }
+    Ok(())
+}
+
+/// A call stops ringing when its meeting ends, and members who never answered now have a missed call.
+async fn notify_call_members(
+    conn: &mut AsyncPgConnection,
+    social_events: &SocialEventHub,
+    room_id: &str,
+) -> anyhow::Result<()> {
+    let member_ids: Vec<Uuid> = call_session_members::table
+        .inner_join(call_sessions::table)
+        .filter(call_sessions::sfu_room_id.eq(room_id))
+        .filter(call_sessions::status.eq("active"))
+        .select(call_session_members::user_id)
+        .load(conn)
+        .await?;
+    social_events.publish(member_ids, SocialResource::Calls);
     Ok(())
 }
 

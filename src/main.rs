@@ -85,7 +85,8 @@ async fn main() {
         .expect("Failed to install Prometheus recorder");
     info!("Prometheus metrics initialized");
 
-    let meeting_recorder = MeetingRecorder::start(pool.clone());
+    let social_events = SocialEventHub::new();
+    let meeting_recorder = MeetingRecorder::start(pool.clone(), social_events.clone());
     info!("Meeting recorder started");
 
     let state = AppState {
@@ -95,7 +96,7 @@ async fn main() {
         metrics_handle,
         enforce_room_access: std::env::var("ENFORCE_ROOM_ACCESS").as_deref() == Ok("true"),
         avatar_storage,
-        social_events: SocialEventHub::new(),
+        social_events,
         meeting_recorder,
     };
 

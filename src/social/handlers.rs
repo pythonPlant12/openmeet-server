@@ -75,6 +75,7 @@ pub fn social_routes() -> Router<AppState> {
         .route("/meetings", get(list_meetings).post(record_meeting))
         .route("/meetings/{id}", delete(delete_meeting))
         .nest("/notifications", notification_routes())
+        .nest("/badges", crate::social::badges::badge_routes())
         .route(
             "/conversations/{id}/call-sessions",
             post(crate::social::start_call_session),

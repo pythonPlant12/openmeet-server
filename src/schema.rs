@@ -211,6 +211,13 @@ diesel::table! {
 }
 
 diesel::table! {
+    missed_call_reads (user_id) {
+        user_id -> Uuid,
+        seen_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     notifications (id) {
         id -> Uuid,
         recipient_id -> Uuid,
@@ -284,6 +291,7 @@ diesel::joinable!(conversation_read_states -> conversations (conversation_id));
 diesel::joinable!(conversation_read_states -> users (user_id));
 diesel::joinable!(call_session_members -> call_sessions (call_session_id));
 diesel::joinable!(call_sessions -> conversations (conversation_id));
+diesel::joinable!(missed_call_reads -> users (user_id));
 diesel::joinable!(group_invitations -> conversations (conversation_id));
 diesel::joinable!(message_reactions -> conversation_messages (message_sequence));
 diesel::joinable!(meeting_participants -> meeting_sessions (meeting_session_id));
@@ -309,6 +317,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     meeting_rooms,
     meeting_sessions,
     message_reactions,
+    missed_call_reads,
     notifications,
     refresh_tokens,
     revoked_sfu_rooms,
