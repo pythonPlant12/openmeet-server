@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
+# Patched dependencies referenced from [patch.crates-io] must exist before dependencies build.
+COPY vendor ./vendor
 
 # Create dummy main.rs for dependency compilation
 RUN mkdir src && echo "fn main() {}" > src/main.rs
