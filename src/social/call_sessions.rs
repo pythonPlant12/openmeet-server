@@ -42,6 +42,16 @@ pub(crate) const CALL_ROOM_ENDED_SQL: &str = "(EXISTS (SELECT 1 FROM meeting_ses
      AND NOT EXISTS (SELECT 1 FROM meeting_sessions AS live_room \
      WHERE live_room.sfu_room_id = {room} AND live_room.ended_at IS NULL))";
 
+/// SQL condition for a call `s` that `member` missed: they never answered it, the call was someone
+/// else's, and it is over (its meeting ended or it expired). Declined calls are not missed.
+pub(crate) fn missed_call_sql() -> String {
+    format!(
+        "(member.status = 'pending' AND s.initiator_id <> member.user_id \
+         AND (s.status <> 'active' OR s.expires_at <= NOW() OR {}))",
+        CALL_ROOM_ENDED_SQL.replace("{room}", "s.sfu_room_id")
+    )
+}
+
 fn call_room_ended() -> diesel::expression::SqlLiteral<Bool> {
     diesel::dsl::sql::<Bool>(&CALL_ROOM_ENDED_SQL.replace("{room}", "call_sessions.sfu_room_id"))
 }

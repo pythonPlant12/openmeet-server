@@ -7,10 +7,13 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use diesel::prelude::*;
+use diesel::{
+    prelude::*,
+    sql_types::{Array, Bool, Text, Uuid as SqlUuid},
+};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -20,10 +23,14 @@ use crate::{
     AppState,
     auth::extract_user_id,
     db::DbPool,
-    schema::{call_session_members, call_sessions, meeting_participants, meeting_sessions, users},
+    schema::{
+        call_read_states, call_session_members, call_sessions, meeting_participants,
+        meeting_sessions, users,
+    },
     social::{
         SocialEventHub, SocialResource,
         avatars::user_avatar_url,
+        call_sessions::missed_call_sql,
         handlers::is_valid_room_id,
         meeting_rooms::room_policies,
         models::{GroupAccessPolicy, UserStatus},
@@ -44,6 +51,7 @@ pub fn meeting_session_routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_meeting_sessions))
         .route("/{id}", get(get_meeting_session))
+        .route("/{id}/read", post(mark_meeting_read))
         .route("/rooms/{room_ref}/summary", get(get_room_summary))
         .route("/rooms/{room_id}/presence", get(get_room_presence))
 }
@@ -350,6 +358,10 @@ struct MeetingSessionResponse {
     ended_at: Option<DateTime<Utc>>,
     participant_count: usize,
     participants: Vec<MeetingPerson>,
+    /// A call that rang for you and that you never answered.
+    missed: bool,
+    /// A missed call you have not opened or marked read yet.
+    unread: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -413,8 +425,17 @@ async fn list_meeting_sessions(
     let attended = meeting_participants::table
         .filter(meeting_participants::user_id.eq(user_id))
         .select(meeting_participants::meeting_session_id);
+    // Calls that rang for the user and that they missed belong in their history too.
+    let missed_room = diesel::dsl::sql::<Bool>(
+        "meeting_sessions.sfu_room_id IN (
+            SELECT s.sfu_room_id FROM call_sessions AS s
+            JOIN call_session_members AS member ON member.call_session_id = s.id
+            WHERE member.user_id = ",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .sql(&format!(" AND {})", missed_call_sql()));
     let mut sessions_query = meeting_sessions::table
-        .filter(meeting_sessions::id.eq_any(attended))
+        .filter(meeting_sessions::id.eq_any(attended).or(missed_room))
         .order(meeting_sessions::started_at.desc())
         .limit(limit + 1)
         .select(MeetingSession::as_select())
@@ -433,7 +454,9 @@ async fn list_meeting_sessions(
         })
         .flatten();
 
-    let meetings = meeting_responses(&mut conn, sessions, user_id, Some(PREVIEW_PEOPLE)).await?;
+    let mut meetings =
+        meeting_responses(&mut conn, sessions, user_id, Some(PREVIEW_PEOPLE)).await?;
+    apply_missed_flags(&mut conn, user_id, &mut meetings).await?;
     Ok(Json(MeetingSessionsPage {
         meetings,
         next_before,
@@ -456,22 +479,26 @@ async fn get_meeting_session(
         .optional()
         .map_err(internal_error)?
         .is_some();
-    // Meetings someone did not attend look the same as meetings that do not exist.
-    if !attended {
-        return Err(meeting_not_found());
-    }
     let session = meeting_sessions::table
         .find(session_id)
         .select(MeetingSession::as_select())
         .first(&mut conn)
         .await
-        .map_err(internal_error)?;
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(meeting_not_found)?;
+    // Meetings someone neither attended nor missed a call for look the same as meetings that do not exist.
+    if !attended
+        && missed_calls(&mut conn, user_id, vec![session.sfu_room_id.clone()])
+            .await?
+            .is_empty()
+    {
+        return Err(meeting_not_found());
+    }
 
-    meeting_responses(&mut conn, vec![session], user_id, None)
-        .await?
-        .pop()
-        .map(Json)
-        .ok_or_else(meeting_not_found)
+    let mut meetings = meeting_responses(&mut conn, vec![session], user_id, None).await?;
+    apply_missed_flags(&mut conn, user_id, &mut meetings).await?;
+    meetings.pop().map(Json).ok_or_else(meeting_not_found)
 }
 
 /// Live state of the meeting a chat link points at. Only counts and times are returned, never names, so
@@ -791,9 +818,135 @@ async fn meeting_responses(
                 ended_at: session.ended_at,
                 participant_count,
                 participants,
+                missed: false,
+                unread: false,
             }
         })
         .collect())
+}
+
+#[derive(QueryableByName)]
+struct MissedCall {
+    #[diesel(sql_type = Text)]
+    sfu_room_id: String,
+    #[diesel(sql_type = SqlUuid)]
+    call_session_id: Uuid,
+    #[diesel(sql_type = Bool)]
+    unread: bool,
+}
+
+/// Calls in these rooms that rang for the user and that they missed, keyed by room.
+async fn missed_calls(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    room_ids: Vec<String>,
+) -> Result<HashMap<String, MissedCall>, (StatusCode, String)> {
+    if room_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<MissedCall> = diesel::sql_query(format!(
+        "SELECT s.sfu_room_id, s.id AS call_session_id,
+                NOT EXISTS (
+                    SELECT 1 FROM call_read_states AS r
+                    WHERE r.call_session_id = s.id AND r.user_id = $1) AS unread
+         FROM call_sessions AS s
+         JOIN call_session_members AS member ON member.call_session_id = s.id
+         WHERE member.user_id = $1 AND s.sfu_room_id = ANY($2) AND {}",
+        missed_call_sql()
+    ))
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<Array<Text>, _>(room_ids)
+    .load(conn)
+    .await
+    .map_err(internal_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.sfu_room_id.clone(), row))
+        .collect())
+}
+
+/// Marks meetings the user did not attend but whose call they missed.
+async fn apply_missed_flags(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    meetings: &mut [MeetingSessionResponse],
+) -> Result<(), (StatusCode, String)> {
+    let attended: HashSet<Uuid> = meeting_participants::table
+        .filter(meeting_participants::user_id.eq(user_id))
+        .filter(
+            meeting_participants::meeting_session_id.eq_any(
+                meetings
+                    .iter()
+                    .map(|meeting| meeting.id)
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .select(meeting_participants::meeting_session_id)
+        .load::<Uuid>(conn)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .collect();
+    let missed = missed_calls(
+        conn,
+        user_id,
+        meetings
+            .iter()
+            .filter(|meeting| !attended.contains(&meeting.id))
+            .map(|meeting| meeting.room_id.clone())
+            .collect(),
+    )
+    .await?;
+    for meeting in meetings.iter_mut() {
+        if attended.contains(&meeting.id) {
+            continue;
+        }
+        if let Some(call) = missed.get(&meeting.room_id) {
+            meeting.missed = true;
+            meeting.unread = call.unread;
+        }
+    }
+    Ok(())
+}
+
+/// Opening a missed call or swiping it read clears its dot and its place in the Calls badge.
+async fn mark_meeting_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let room_id = meeting_sessions::table
+        .find(session_id)
+        .select(meeting_sessions::sfu_room_id)
+        .first::<String>(&mut conn)
+        .await
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(meeting_not_found)?;
+    let Some(call) = missed_calls(&mut conn, user_id, vec![room_id])
+        .await?
+        .into_values()
+        .next()
+    else {
+        // Only missed calls have a read state; anything else is already read.
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    diesel::insert_into(call_read_states::table)
+        .values((
+            call_read_states::call_session_id.eq(call.call_session_id),
+            call_read_states::user_id.eq(user_id),
+        ))
+        .on_conflict_do_nothing()
+        .execute(&mut conn)
+        .await
+        .map_err(internal_error)?;
+    // Other open tabs update their dot and badge.
+    state
+        .social_events
+        .publish([user_id], SocialResource::Calls);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn meeting_not_found() -> (StatusCode, String) {

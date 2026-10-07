@@ -1,13 +1,12 @@
 //! Badge counts for the workspace sidebar: conversations with unread messages or pending requests,
-//! incoming friend requests, and calls the user missed since last looking at their calls.
+//! incoming friend requests, and missed calls the user has not read yet.
 
 use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::get,
 };
-use chrono::Utc;
 use diesel::{
     prelude::*,
     sql_types::{BigInt, Uuid as SqlUuid},
@@ -16,12 +15,7 @@ use diesel_async::RunQueryDsl;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::{
-    AppState,
-    auth::extract_user_id,
-    schema::missed_call_reads,
-    social::{SocialResource, call_sessions::CALL_ROOM_ENDED_SQL},
-};
+use crate::{AppState, auth::extract_user_id, social::call_sessions::missed_call_sql};
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 
@@ -37,41 +31,13 @@ pub struct BadgeCounts {
 }
 
 pub fn badge_routes() -> Router<AppState> {
-    Router::new()
-        .route("/", get(get_badges))
-        .route("/calls/seen", post(mark_calls_seen))
+    Router::new().route("/", get(get_badges))
 }
 
 async fn get_badges(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<BadgeCounts> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
     Ok(Json(load_badges(&mut conn, user_id).await?))
-}
-
-async fn mark_calls_seen(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<BadgeCounts> {
-    let user_id = extract_user_id(&state.jwt, &headers)?;
-    let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let now = Utc::now();
-    diesel::insert_into(missed_call_reads::table)
-        .values((
-            missed_call_reads::user_id.eq(user_id),
-            missed_call_reads::seen_at.eq(now),
-        ))
-        .on_conflict(missed_call_reads::user_id)
-        .do_update()
-        .set(missed_call_reads::seen_at.eq(now))
-        .execute(&mut conn)
-        .await
-        .map_err(internal_error)?;
-    let badges = load_badges(&mut conn, user_id).await?;
-    // Other open tabs clear the Calls badge too.
-    state
-        .social_events
-        .publish([user_id], SocialResource::Calls);
-    Ok(Json(badges))
 }
 
 async fn load_badges(
@@ -86,8 +52,7 @@ async fn load_badges(
 }
 
 /// The counts mirror what the sidebar lists: conversations come from group memberships and from direct
-/// conversations the user has not hidden, and a call is missed when the user never answered it and it is
-/// over (its meeting ended or the call expired). Declined calls are not missed.
+/// conversations the user has not hidden, and calls count while missed and unread.
 fn badges_sql() -> String {
     format!(
         "SELECT
@@ -122,22 +87,15 @@ fn badges_sql() -> String {
             )::BIGINT AS messages,
             (SELECT COUNT(*) FROM friendships
              WHERE addressee_id = $1 AND status = 'pending')::BIGINT AS friends,
-            (
-                (SELECT COUNT(*) FROM call_session_members AS member
-                 JOIN call_sessions AS s ON s.id = member.call_session_id
-                 WHERE member.user_id = $1
-                   AND member.status = 'pending'
-                   AND s.initiator_id <> $1
-                   AND s.created_at > COALESCE(
-                        (SELECT seen_at FROM missed_call_reads WHERE user_id = $1), '-infinity')
-                   AND (s.status <> 'active' OR s.expires_at <= NOW() OR {ended}))
-              + (SELECT COUNT(*) FROM call_invitations AS i
-                 WHERE i.callee_id = $1
-                   AND i.created_at > COALESCE(
-                        (SELECT seen_at FROM missed_call_reads WHERE user_id = $1), '-infinity')
-                   AND (i.status = 'expired' OR (i.status = 'pending' AND i.expires_at <= NOW())))
+            (SELECT COUNT(*) FROM call_session_members AS member
+             JOIN call_sessions AS s ON s.id = member.call_session_id
+             WHERE member.user_id = $1
+               AND {missed}
+               AND NOT EXISTS (
+                    SELECT 1 FROM call_read_states AS r
+                    WHERE r.call_session_id = s.id AND r.user_id = $1)
             )::BIGINT AS calls",
-        ended = CALL_ROOM_ENDED_SQL.replace("{room}", "s.sfu_room_id"),
+        missed = missed_call_sql(),
     )
 }
 
@@ -154,10 +112,10 @@ mod tests {
     use super::badges_sql;
 
     #[test]
-    fn missed_calls_use_the_call_room_end_rule() {
+    fn counts_only_unread_missed_calls() {
         let sql = badges_sql();
-        assert!(sql.contains("meeting_sessions"));
-        assert!(sql.contains("s.sfu_room_id"));
-        assert!(!sql.contains("{room}"));
+        assert!(sql.contains("member.status = 'pending'"));
+        assert!(sql.contains("call_read_states"));
+        assert!(!sql.contains("{room}") && !sql.contains("{missed}"));
     }
 }
