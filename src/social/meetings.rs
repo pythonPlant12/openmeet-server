@@ -381,7 +381,10 @@ struct RoomSummaryResponse {
 struct ParticipantPresenceResponse {
     participant_id: String,
     user_id: Uuid,
-    status: UserStatus,
+    /// Hidden when the person does not share their status with meeting peers.
+    status: Option<UserStatus>,
+    /// Avatars show beside names in the meeting, as they do in its history.
+    avatar_url: Option<String>,
 }
 
 struct Connection {
@@ -563,14 +566,22 @@ async fn get_room_presence(
         .iter()
         .map(|(_, connected_user_id)| *connected_user_id)
         .collect::<HashSet<_>>();
-    let statuses: HashMap<Uuid, UserStatus> = users::table
+    let accounts: HashMap<Uuid, (Option<UserStatus>, Option<String>)> = users::table
         .filter(users::id.eq_any(user_ids))
-        .select((users::id, users::status))
-        .load::<(Uuid, String)>(&mut conn)
+        .select((users::id, users::status, users::avatar_key))
+        .load::<(Uuid, String, Option<String>)>(&mut conn)
         .await
         .map_err(internal_error)?
         .into_iter()
-        .filter_map(|(id, status)| UserStatus::from_db_value(&status).map(|status| (id, status)))
+        .map(|(id, status, avatar_key)| {
+            (
+                id,
+                (
+                    UserStatus::from_db_value(&status),
+                    avatar_key.map(|key| user_avatar_url(id, &key)),
+                ),
+            )
+        })
         .collect();
 
     Ok(Json(
@@ -582,16 +593,16 @@ async fn get_room_presence(
                 } else {
                     Relationship::MEETING_PEER
                 };
-                if !presence::can_see(presence::visibility_for(connected_user_id), relationship) {
-                    return None;
-                }
-                statuses
-                    .get(&connected_user_id)
-                    .map(|status| ParticipantPresenceResponse {
-                        participant_id,
-                        user_id: connected_user_id,
-                        status: *status,
-                    })
+                let (status, avatar_url) = accounts.get(&connected_user_id)?;
+                let status = status.filter(|_| {
+                    presence::can_see(presence::visibility_for(connected_user_id), relationship)
+                });
+                Some(ParticipantPresenceResponse {
+                    participant_id,
+                    user_id: connected_user_id,
+                    status,
+                    avatar_url: avatar_url.clone(),
+                })
             })
             .collect(),
     ))
