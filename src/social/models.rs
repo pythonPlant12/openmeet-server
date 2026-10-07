@@ -5,8 +5,9 @@ use uuid::Uuid;
 
 use crate::schema::{
     call_invitations, call_session_members, call_sessions, conversation_members,
-    conversation_messages, conversations, direct_message_requests, friendships, group_invitations,
-    meeting_history, notifications, revoked_sfu_rooms, user_presence, users,
+    conversation_message_attachments, conversation_messages, conversations,
+    direct_message_requests, friendships, group_invitations, meeting_history, notifications,
+    revoked_sfu_rooms, user_presence, users,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -130,6 +131,30 @@ pub struct NewConversationMessage {
     pub sender_name: String,
     pub content: String,
     pub reply_to_sequence: Option<i64>,
+}
+
+#[derive(Debug, Queryable, Selectable)]
+#[diesel(table_name = conversation_message_attachments)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ConversationMessageAttachment {
+    pub id: Uuid,
+    pub message_sequence: i64,
+    pub storage_key: String,
+    pub file_name: String,
+    pub content_type: String,
+    pub byte_size: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = conversation_message_attachments)]
+pub struct NewConversationMessageAttachment {
+    pub id: Uuid,
+    pub message_sequence: i64,
+    pub storage_key: String,
+    pub file_name: String,
+    pub content_type: String,
+    pub byte_size: i64,
 }
 
 #[derive(Debug, Queryable, Selectable)]
@@ -741,6 +766,17 @@ pub struct ConversationMessageResponse {
     pub created_at: DateTime<Utc>,
     pub reply_to: Option<MessageReplyPreview>,
     pub reactions: Vec<MessageReactionSummary>,
+    pub attachments: Vec<MessageAttachmentResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageAttachmentResponse {
+    pub id: Uuid,
+    pub file_name: String,
+    pub content_type: String,
+    pub byte_size: i64,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
