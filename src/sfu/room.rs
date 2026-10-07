@@ -1,7 +1,9 @@
 use crate::sfu::packet_buffer::RtpPacketBuffer;
 use crate::sfu::participant::ParticipantConnection;
 use crate::sfu::peer_connection::SfuPeerConnection;
-use crate::signaling::message::{ChatMessagePayload, SignalingMessage};
+use crate::signaling::message::{
+    ChatMessagePayload, ChatMessageReaction, ChatReplyPreview, SignalingMessage,
+};
 use metrics::counter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -28,6 +30,8 @@ use webrtc::track::track_remote::TrackRemote;
 const RTP_BROADCAST_CAPACITY: usize = 4096;
 const CHAT_HISTORY_CAPACITY: usize = 500;
 const ROOM_CHAT_RATE_LIMIT: usize = 50;
+/// Distinct emoji one meeting chat message can collect.
+const MAX_CHAT_MESSAGE_REACTIONS: usize = 20;
 const ROOM_CHAT_RATE_WINDOW: Duration = Duration::from_secs(5);
 const LOSS_RECOVERY_PLI_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -92,6 +96,7 @@ pub struct Room {
     /// a=msid lines that browsers reject.
     pub forwarded_senders: ForwardedSenders,
     chat_history: VecDeque<ChatMessagePayload>,
+    last_chat_message_id: u64,
     recent_chat_messages: VecDeque<Instant>,
 }
 
@@ -109,6 +114,7 @@ impl Room {
             forwarded_tracks: Arc::new(RwLock::new(HashMap::new())),
             forwarded_senders: Arc::new(RwLock::new(HashMap::new())),
             chat_history: VecDeque::with_capacity(CHAT_HISTORY_CAPACITY),
+            last_chat_message_id: 0,
             recent_chat_messages: VecDeque::with_capacity(ROOM_CHAT_RATE_LIMIT),
         }
     }
@@ -149,6 +155,7 @@ impl Room {
     pub fn add_participant(&mut self, participant: ParticipantConnection) {
         let participant_id = participant.participant.id.clone();
         let participant_name = participant.participant.name.clone();
+        let screen_share_of = participant.participant.screen_share_of.clone();
 
         info!(
             "Adding participant {} ({}) to room {}",
@@ -164,6 +171,7 @@ impl Room {
             SignalingMessage::ParticipantJoined {
                 participant_id: participant_id.clone(),
                 participant_name,
+                screen_share_of,
             },
         );
 
@@ -487,11 +495,72 @@ impl Room {
         true
     }
 
-    pub fn record_chat_message(&mut self, message: ChatMessagePayload) {
+    /// Stores a message under the next room-scoped ID and returns it as recorded.
+    pub fn record_chat_message(&mut self, mut message: ChatMessagePayload) -> ChatMessagePayload {
+        self.last_chat_message_id += 1;
+        message.id = self.last_chat_message_id;
         if self.chat_history.len() == CHAT_HISTORY_CAPACITY {
             self.chat_history.pop_front();
         }
-        self.chat_history.push_back(message);
+        self.chat_history.push_back(message.clone());
+        message
+    }
+
+    /// Quote of a message still in the room's history.
+    pub fn chat_reply_preview(&self, message_id: u64) -> Option<ChatReplyPreview> {
+        self.chat_history
+            .iter()
+            .find(|message| message.id == message_id)
+            .map(|message| ChatReplyPreview {
+                id: message.id,
+                participant_id: message.participant_id.clone(),
+                participant_name: message.participant_name.clone(),
+                message: crate::social::message_excerpt(&message.message),
+            })
+    }
+
+    /// Adds the participant's reaction, or removes it when they already reacted with the emoji. Returns
+    /// the message's reactions after the change, or `None` when nothing changed.
+    pub fn toggle_chat_reaction(
+        &mut self,
+        message_id: u64,
+        participant_id: &str,
+        emoji: &str,
+    ) -> Option<Vec<ChatMessageReaction>> {
+        let message = self
+            .chat_history
+            .iter_mut()
+            .find(|message| message.id == message_id)?;
+        match message
+            .reactions
+            .iter()
+            .position(|reaction| reaction.emoji == emoji)
+        {
+            Some(index) => {
+                let reaction = &mut message.reactions[index];
+                match reaction
+                    .participant_ids
+                    .iter()
+                    .position(|id| id == participant_id)
+                {
+                    Some(reactor) => {
+                        reaction.participant_ids.remove(reactor);
+                        if reaction.participant_ids.is_empty() {
+                            message.reactions.remove(index);
+                        }
+                    }
+                    None => reaction.participant_ids.push(participant_id.to_string()),
+                }
+            }
+            None if message.reactions.len() < MAX_CHAT_MESSAGE_REACTIONS => {
+                message.reactions.push(ChatMessageReaction {
+                    emoji: emoji.to_string(),
+                    participant_ids: vec![participant_id.to_string()],
+                });
+            }
+            None => return None,
+        }
+        Some(message.reactions.clone())
     }
 
     pub fn chat_history(&self) -> Vec<ChatMessagePayload> {
@@ -535,7 +604,9 @@ impl Room {
     }
 
     /// Get list of all participants with their media states
-    pub fn get_participants_with_media_state(&self) -> Vec<(String, String, bool, bool)> {
+    pub fn get_participants_with_media_state(
+        &self,
+    ) -> Vec<(String, String, bool, bool, Option<String>)> {
         self.participants
             .iter()
             .map(|(id, conn)| {
@@ -544,8 +615,32 @@ impl Room {
                     conn.participant.name.clone(),
                     conn.participant.audio_enabled,
                     conn.participant.video_enabled,
+                    conn.participant.screen_share_of.clone(),
                 )
             })
+            .collect()
+    }
+
+    /// Whether media from `sender_id` goes to `receiver_id`. Screen shares only send, and a presenter
+    /// already sees their own screen locally, so neither receives those forwards.
+    pub fn should_forward(&self, sender_id: &str, receiver_id: &str) -> bool {
+        if sender_id == receiver_id {
+            return false;
+        }
+        let screen_share_of = |id: &str| {
+            self.participants
+                .get(id)
+                .and_then(|conn| conn.participant.screen_share_of.as_deref())
+        };
+        screen_share_of(receiver_id).is_none() && screen_share_of(sender_id) != Some(receiver_id)
+    }
+
+    /// Screen shares a presenter started, which end when the presenter leaves.
+    pub fn screen_shares_of(&self, owner_id: &str) -> Vec<String> {
+        self.participants
+            .iter()
+            .filter(|(_, conn)| conn.participant.screen_share_of.as_deref() == Some(owner_id))
+            .map(|(id, _)| id.clone())
             .collect()
     }
 
@@ -619,7 +714,7 @@ impl Room {
         )> = Vec::new();
 
         for (participant_id, participant_conn) in &self.participants {
-            if participant_id == sender_id {
+            if !self.should_forward(sender_id, participant_id) {
                 continue;
             }
 
@@ -1283,6 +1378,7 @@ mod tests {
                 participant_name: "Alice".to_string(),
                 message: format!("Message {timestamp}"),
                 timestamp,
+                ..ChatMessagePayload::default()
             });
         }
 
@@ -1293,6 +1389,68 @@ mod tests {
             history.last().unwrap().timestamp,
             CHAT_HISTORY_CAPACITY as u64
         );
+    }
+
+    #[test]
+    fn chat_messages_get_increasing_ids_and_reply_quotes() {
+        let mut room = Room::new("room-1".to_string());
+        let first = room.record_chat_message(ChatMessagePayload {
+            participant_id: "peer-1".to_string(),
+            participant_name: "Alice".to_string(),
+            message: "a".repeat(200),
+            ..ChatMessagePayload::default()
+        });
+        let second = room.record_chat_message(ChatMessagePayload::default());
+
+        assert_eq!((first.id, second.id), (1, 2));
+        let quote = room.chat_reply_preview(first.id).unwrap();
+        assert_eq!(quote.participant_name, "Alice");
+        assert!(quote.message.ends_with('…'));
+        assert!(room.chat_reply_preview(99).is_none());
+    }
+
+    #[test]
+    fn chat_reactions_toggle_per_participant() {
+        let mut room = Room::new("room-1".to_string());
+        let message = room.record_chat_message(ChatMessagePayload::default());
+
+        room.toggle_chat_reaction(message.id, "peer-1", "👍");
+        let reactions = room
+            .toggle_chat_reaction(message.id, "peer-2", "👍")
+            .unwrap();
+        assert_eq!(reactions[0].participant_ids, ["peer-1", "peer-2"]);
+
+        room.toggle_chat_reaction(message.id, "peer-1", "👍");
+        let reactions = room
+            .toggle_chat_reaction(message.id, "peer-2", "👍")
+            .unwrap();
+        assert!(reactions.is_empty());
+        assert!(room.chat_history()[0].reactions.is_empty());
+        assert!(room.toggle_chat_reaction(99, "peer-1", "👍").is_none());
+    }
+
+    #[test]
+    fn screen_shares_only_send_and_skip_their_presenter() {
+        let mut room = Room::new("room-1".to_string());
+        for (id, screen_share_of) in [
+            ("alice", None),
+            ("bob", None),
+            ("alice-screen", Some("alice".to_string())),
+        ] {
+            let mut participant = Participant::new(id.to_string(), id.to_string());
+            participant.screen_share_of = screen_share_of;
+            let (tx, _rx) = mpsc::unbounded_channel();
+            room.participants
+                .insert(id.to_string(), ParticipantConnection::new(participant, tx));
+        }
+
+        assert!(room.should_forward("alice-screen", "bob"));
+        assert!(!room.should_forward("alice-screen", "alice"));
+        assert!(!room.should_forward("bob", "alice-screen"));
+        assert!(!room.should_forward("alice", "alice"));
+        assert!(room.should_forward("alice", "bob"));
+        assert_eq!(room.screen_shares_of("alice"), ["alice-screen"]);
+        assert!(room.screen_shares_of("bob").is_empty());
     }
 
     #[test]

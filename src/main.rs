@@ -16,7 +16,7 @@ use openmeet_server::auth::JwtConfig;
 use openmeet_server::build_router;
 use openmeet_server::db::create_pool;
 use openmeet_server::sfu::repository::{InMemoryRoomRepository, RoomRepository};
-use openmeet_server::social::SocialEventHub;
+use openmeet_server::social::{MeetingRecorder, SocialEventHub};
 use openmeet_server::storage::S3AvatarStorage;
 
 // Embed migrations at compile time
@@ -85,6 +85,10 @@ async fn main() {
         .expect("Failed to install Prometheus recorder");
     info!("Prometheus metrics initialized");
 
+    let social_events = SocialEventHub::new();
+    let meeting_recorder = MeetingRecorder::start(pool.clone(), social_events.clone());
+    info!("Meeting recorder started");
+
     let state = AppState {
         pool,
         jwt,
@@ -92,7 +96,8 @@ async fn main() {
         metrics_handle,
         enforce_room_access: std::env::var("ENFORCE_ROOM_ACCESS").as_deref() == Ok("true"),
         avatar_storage,
-        social_events: SocialEventHub::new(),
+        social_events,
+        meeting_recorder,
     };
 
     let app = build_router(state);

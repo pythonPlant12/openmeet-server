@@ -27,6 +27,10 @@ futures-util = "0.3"
 # WebRTC
 webrtc = "0.17.1"
 
+# Outbound HTTP for chat link previews
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+url = "2.5"
+
 # Utilities
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
 anyhow = "1.0"

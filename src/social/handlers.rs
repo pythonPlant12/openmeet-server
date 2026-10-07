@@ -75,11 +75,24 @@ pub fn social_routes() -> Router<AppState> {
         .route("/meetings", get(list_meetings).post(record_meeting))
         .route("/meetings/{id}", delete(delete_meeting))
         .nest("/notifications", notification_routes())
+        .nest("/badges", crate::social::badges::badge_routes())
         .route(
             "/conversations/{id}/call-sessions",
             post(crate::social::start_call_session),
         )
         .nest("/call-sessions", crate::social::call_session_routes())
+        .nest(
+            "/meeting-sessions",
+            crate::social::meetings::meeting_session_routes(),
+        )
+        .nest(
+            "/meeting-rooms",
+            crate::social::meeting_rooms::meeting_room_routes(),
+        )
+        .nest(
+            "/link-previews",
+            crate::social::link_previews::link_preview_routes(),
+        )
         .nest("/conversations", conversation_routes())
 }
 
@@ -1125,7 +1138,7 @@ fn call_response(
     }
 }
 
-fn is_valid_room_id(room_id: &str) -> bool {
+pub(super) fn is_valid_room_id(room_id: &str) -> bool {
     !room_id.is_empty()
         && room_id.len() <= 128
         && room_id

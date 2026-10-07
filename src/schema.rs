@@ -63,6 +63,53 @@ diesel::table! {
 }
 
 diesel::table! {
+    meeting_participants (id) {
+        id -> Uuid,
+        meeting_session_id -> Uuid,
+        #[max_length = 64]
+        participant_id -> Varchar,
+        user_id -> Nullable<Uuid>,
+        #[max_length = 80]
+        display_name -> Varchar,
+        joined_at -> Timestamptz,
+        left_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    meeting_room_invitations (room_id, user_id) {
+        #[max_length = 128]
+        room_id -> Varchar,
+        user_id -> Uuid,
+        invited_by -> Uuid,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    meeting_rooms (room_id) {
+        #[max_length = 128]
+        room_id -> Varchar,
+        owner_id -> Uuid,
+        #[max_length = 20]
+        access_policy -> Varchar,
+        password_hash -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    meeting_sessions (id) {
+        id -> Uuid,
+        #[max_length = 128]
+        sfu_room_id -> Varchar,
+        started_at -> Timestamptz,
+        ended_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
     message_reactions (message_sequence, user_id, emoji) {
         message_sequence -> Int8,
         user_id -> Uuid,
@@ -164,6 +211,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    call_read_states (call_session_id, user_id) {
+        call_session_id -> Uuid,
+        user_id -> Uuid,
+        read_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     notifications (id) {
         id -> Uuid,
         recipient_id -> Uuid,
@@ -237,11 +292,18 @@ diesel::joinable!(conversation_read_states -> conversations (conversation_id));
 diesel::joinable!(conversation_read_states -> users (user_id));
 diesel::joinable!(call_session_members -> call_sessions (call_session_id));
 diesel::joinable!(call_sessions -> conversations (conversation_id));
+diesel::joinable!(call_read_states -> call_sessions (call_session_id));
+diesel::joinable!(call_read_states -> users (user_id));
 diesel::joinable!(group_invitations -> conversations (conversation_id));
 diesel::joinable!(message_reactions -> conversation_messages (message_sequence));
+diesel::joinable!(meeting_participants -> meeting_sessions (meeting_session_id));
+diesel::joinable!(meeting_participants -> users (user_id));
+diesel::joinable!(meeting_room_invitations -> meeting_rooms (room_id));
+diesel::joinable!(meeting_rooms -> users (owner_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     call_invitations,
+    call_read_states,
     call_session_members,
     call_sessions,
     conversation_members,
@@ -253,6 +315,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     friendships,
     group_invitations,
     meeting_history,
+    meeting_participants,
+    meeting_room_invitations,
+    meeting_rooms,
+    meeting_sessions,
     message_reactions,
     notifications,
     refresh_tokens,

@@ -36,6 +36,8 @@ pub struct Relationship {
     pub is_self: bool,
     pub is_friend: bool,
     pub shares_group: bool,
+    /// Both people are connected to the same live meeting right now.
+    pub shares_meeting: bool,
 }
 
 impl Relationship {
@@ -43,11 +45,20 @@ impl Relationship {
         is_self: false,
         is_friend: true,
         shares_group: false,
+        shares_meeting: false,
     };
     pub const SELF: Self = Self {
         is_self: true,
         is_friend: false,
         shares_group: false,
+        shares_meeting: false,
+    };
+    /// People in the same live meeting see each other's status on their video tiles.
+    pub const MEETING_PEER: Self = Self {
+        is_self: false,
+        is_friend: false,
+        shares_group: false,
+        shares_meeting: true,
     };
 }
 
@@ -66,6 +77,10 @@ pub fn visibility_for(_user_id: Uuid) -> PresenceVisibility {
 pub fn can_see(visibility: PresenceVisibility, relationship: Relationship) -> bool {
     if relationship.is_self {
         return true;
+    }
+    // A shared live meeting already shows who is there, so only users who hide from everyone stay hidden.
+    if relationship.shares_meeting {
+        return visibility != PresenceVisibility::Nobody;
     }
     match visibility {
         PresenceVisibility::Everyone => true,
@@ -126,6 +141,7 @@ pub async fn visible_group_member_presence(
                     is_self: *user_id == viewer_id,
                     is_friend: friend_ids.contains(user_id),
                     shares_group: true,
+                    shares_meeting: false,
                 },
             )
             .map(|presence| (*user_id, presence))
@@ -176,11 +192,13 @@ mod tests {
         is_self: false,
         is_friend: false,
         shares_group: false,
+        shares_meeting: false,
     };
     const GROUP_CONTACT: Relationship = Relationship {
         is_self: false,
         is_friend: false,
         shares_group: true,
+        shares_meeting: false,
     };
 
     #[test]
@@ -230,6 +248,22 @@ mod tests {
         assert!(!can_see(PresenceVisibility::Nobody, Relationship::FRIEND));
         assert!(can_see(PresenceVisibility::Nobody, Relationship::SELF));
         assert!(can_see(PresenceVisibility::Everyone, STRANGER));
+    }
+
+    #[test]
+    fn meeting_peers_see_status_unless_the_user_hides_from_everyone() {
+        assert!(can_see(
+            PresenceVisibility::Friends,
+            Relationship::MEETING_PEER
+        ));
+        assert!(can_see(
+            PresenceVisibility::Contacts,
+            Relationship::MEETING_PEER
+        ));
+        assert!(!can_see(
+            PresenceVisibility::Nobody,
+            Relationship::MEETING_PEER
+        ));
     }
 
     #[test]

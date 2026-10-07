@@ -13,6 +13,8 @@ pub struct Participant {
     pub audio_enabled: bool,
     pub video_enabled: bool,
     pub user_id: Option<Uuid>,
+    /// Set for a presenter's screen share, which joins as its own send-only connection.
+    pub screen_share_of: Option<String>,
 }
 
 impl Participant {
@@ -23,6 +25,7 @@ impl Participant {
             audio_enabled: true,
             video_enabled: true,
             user_id: None,
+            screen_share_of: None,
         }
     }
 

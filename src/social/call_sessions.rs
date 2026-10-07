@@ -34,6 +34,28 @@ use crate::{
 
 const CALL_SESSION_TTL: Duration = Duration::hours(1);
 
+/// SQL condition, with `{room}` standing for the call's SFU room ID, that holds once the call is over: its
+/// room had a meeting and none is live now. A caller who reconnects makes the room live again, so this
+/// stays a query-time rule instead of a stored status.
+pub(crate) const CALL_ROOM_ENDED_SQL: &str = "(EXISTS (SELECT 1 FROM meeting_sessions AS ended_room \
+     WHERE ended_room.sfu_room_id = {room}) \
+     AND NOT EXISTS (SELECT 1 FROM meeting_sessions AS live_room \
+     WHERE live_room.sfu_room_id = {room} AND live_room.ended_at IS NULL))";
+
+/// SQL condition for a call `s` that `member` missed: they never answered it, the call was someone
+/// else's, and it is over (its meeting ended or it expired). Declined calls are not missed.
+pub(crate) fn missed_call_sql() -> String {
+    format!(
+        "(member.status = 'pending' AND s.initiator_id <> member.user_id \
+         AND (s.status <> 'active' OR s.expires_at <= NOW() OR {}))",
+        CALL_ROOM_ENDED_SQL.replace("{room}", "s.sfu_room_id")
+    )
+}
+
+fn call_room_ended() -> diesel::expression::SqlLiteral<Bool> {
+    diesel::dsl::sql::<Bool>(&CALL_ROOM_ENDED_SQL.replace("{room}", "call_sessions.sfu_room_id"))
+}
+
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +122,16 @@ pub async fn start_call_session(
                 let participant_ids = snapshot_participants(conn, &conversation, user_id).await?;
 
                 expire_call_sessions(conn, now).await?;
+                // A call whose meeting has ended no longer blocks a new one.
+                diesel::update(
+                    call_sessions::table
+                        .filter(call_sessions::conversation_id.eq(conversation_id))
+                        .filter(call_sessions::status.eq("active"))
+                        .filter(call_room_ended()),
+                )
+                .set(call_sessions::status.eq("expired"))
+                .execute(conn)
+                .await?;
                 let existing_session = call_sessions::table
                     .filter(call_sessions::conversation_id.eq(conversation_id))
                     .filter(call_sessions::status.eq("active"))
@@ -178,6 +210,8 @@ async fn list_incoming_call_sessions(
         .filter(call_session_members::status.eq("pending"))
         .filter(call_sessions::status.eq("active"))
         .filter(call_sessions::expires_at.gt(now))
+        // Everyone left, so the call stops ringing and counts as missed.
+        .filter(diesel::dsl::not(call_room_ended()))
         .order(call_sessions::created_at.desc())
         .select(CallSession::as_select())
         .load(&mut conn)
@@ -499,10 +533,19 @@ fn is_direct_participant(low_id: Uuid, high_id: Uuid, user_id: Uuid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CALL_SESSION_TTL, SfuRoomAuthorization, call_session_response,
+        CALL_ROOM_ENDED_SQL, CALL_SESSION_TTL, SfuRoomAuthorization, call_session_response,
         classify_sfu_room_authorization, is_direct_participant,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn a_call_ends_only_after_its_room_had_a_meeting_and_none_is_live() {
+        let sql = CALL_ROOM_ENDED_SQL.replace("{room}", "s.sfu_room_id");
+        assert!(sql.contains("EXISTS (SELECT 1 FROM meeting_sessions AS ended_room"));
+        assert!(sql.contains("NOT EXISTS (SELECT 1 FROM meeting_sessions AS live_room"));
+        assert!(sql.contains("live_room.ended_at IS NULL"));
+        assert_eq!(sql.matches("s.sfu_room_id").count(), 2);
+    }
 
     #[test]
     fn call_sessions_have_a_bounded_lifetime() {

@@ -28,7 +28,10 @@ use crate::sfu::{
     room::Room,
 };
 use crate::signaling::message::{ChatMessagePayload, SignalingMessage};
-use crate::social::{SfuRoomAuthorization, authorize_sfu_room};
+use crate::social::{
+    MeetingRecorder, MeetingRoomAdmission, SfuRoomAuthorization, admit_to_meeting_room,
+    authorize_sfu_room,
+};
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
@@ -113,6 +116,7 @@ pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<AppStat
 /// Handle an individual WebSocket connection
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let room_repo = Arc::clone(&state.room_repo);
+    let meeting_recorder = state.meeting_recorder.clone();
     let (mut sender, mut receiver) = socket.split();
 
     // Channel for sending messages to this client
@@ -229,6 +233,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 &room_repo_clone,
                                 &mut recent_chat_messages,
                                 &state.pool,
+                                &state.meeting_recorder,
                                 identity.user_id,
                                 identity.display_name.as_deref(),
                             )
@@ -277,6 +282,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             }
         }
     }
+
+    // Every exit path ends here, including removals that did not go through this socket's cleanup.
+    meeting_recorder.participant_left(&participant_id);
 
     info!("WebSocket connection closed: {}", participant_id);
 
@@ -357,6 +365,10 @@ async fn cleanup_participant_from_room(
     }
 
     room.remove_participant(participant_id).await;
+    // A presenter's screen share cannot outlive them.
+    for screen_share_id in room.screen_shares_of(participant_id) {
+        room.remove_participant(&screen_share_id).await;
+    }
 
     // Delete room if empty
     if room.is_empty() {
@@ -371,6 +383,22 @@ async fn cleanup_participant_from_room(
     true
 }
 
+/// Per-connection limit on chat messages and reactions within a sliding window.
+fn allow_sender_chat_action(recent: &mut VecDeque<Instant>) -> bool {
+    let now = Instant::now();
+    while recent
+        .front()
+        .is_some_and(|sent_at| now.duration_since(*sent_at) >= CHAT_RATE_WINDOW)
+    {
+        recent.pop_front();
+    }
+    if recent.len() >= CHAT_RATE_LIMIT {
+        return false;
+    }
+    recent.push_back(now);
+    true
+}
+
 /// Handle individual signaling messages
 async fn handle_message(
     message: SignalingMessage,
@@ -381,6 +409,7 @@ async fn handle_message(
     room_repo: &Arc<dyn RoomRepository>,
     recent_chat_messages: &mut VecDeque<Instant>,
     pool: &crate::db::DbPool,
+    meeting_recorder: &MeetingRecorder,
     session_user_id: Option<Uuid>,
     session_display_name: Option<&str>,
 ) {
@@ -388,6 +417,8 @@ async fn handle_message(
         SignalingMessage::Join {
             room_id,
             participant_name: name,
+            password,
+            screen_share_of,
         } => {
             if current_room_id.is_some() {
                 warn!(
@@ -430,6 +461,28 @@ async fn handle_message(
                     return;
                 }
             };
+
+            // Rooms that are not conversation calls may belong to a signed-in host with an access policy.
+            if room_authorization == SfuRoomAuthorization::Legacy {
+                match admit_to_meeting_room(pool, &room_id, session_user_id, password.as_deref())
+                    .await
+                {
+                    Ok(MeetingRoomAdmission::Allowed) => {}
+                    Ok(admission) => {
+                        let _ = tx.send(SignalingMessage::Error {
+                            message: admission.message().to_string(),
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        error!("Failed to check meeting room {}: {}", room_id, error);
+                        let _ = tx.send(SignalingMessage::Error {
+                            message: "Unable to authorize meeting".to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
 
             info!(
                 "Participant {} ({}) joining room {}",
@@ -489,6 +542,20 @@ async fn handle_message(
                     return;
                 }
 
+                // A screen share belongs to a presenter already in this room, signed in as the same user.
+                if let Some(owner_id) = &screen_share_of {
+                    let owner_present = room.participants.get(owner_id).is_some_and(|owner| {
+                        owner.participant.screen_share_of.is_none()
+                            && owner.participant.user_id == session_user_id
+                    });
+                    if !owner_present {
+                        let _ = tx.send(SignalingMessage::Error {
+                            message: "Screen share presenter is not in this meeting".to_string(),
+                        });
+                        return;
+                    }
+                }
+
                 // Get list of existing participants before adding new one (including media states)
                 let existing_participants = room.get_participants_with_media_state();
                 let chat_history = room.chat_history();
@@ -496,6 +563,7 @@ async fn handle_message(
                 // Create participant and add to room
                 let mut participant = Participant::new(participant_id.to_string(), name.clone());
                 participant.user_id = session_user_id;
+                participant.screen_share_of = screen_share_of.clone();
                 let mut participant_conn = ParticipantConnection::new(participant, tx.clone());
 
                 // Create WebRTC peer connection for this participant
@@ -742,6 +810,15 @@ async fn handle_message(
                 }
 
                 room.add_participant(participant_conn);
+                // A screen share is not another person in the meeting history.
+                if screen_share_of.is_none() {
+                    meeting_recorder.participant_joined(
+                        &room_id,
+                        participant_id,
+                        session_user_id,
+                        &name,
+                    );
+                }
                 // Metrics: participant joined
                 counter!("sfu_participants_joined_total").increment(1);
 
@@ -760,11 +837,14 @@ async fn handle_message(
                 });
 
                 // Send list of existing participants to the new joiner (with media states)
-                for (id, name, audio_enabled, video_enabled) in existing_participants {
+                for (id, name, audio_enabled, video_enabled, screen_share_of) in
+                    existing_participants
+                {
                     // Send ParticipantJoined first
                     let _ = tx.send(SignalingMessage::ParticipantJoined {
                         participant_id: id.clone(),
                         participant_name: name,
+                        screen_share_of,
                     });
 
                     // If media state is not default (both enabled), send MediaStateChanged
@@ -842,7 +922,9 @@ async fn handle_message(
                                             )> =
                                                 room.participant_tracks
                                                     .iter()
-                                                    .filter(|(id, _)| *id != participant_id)
+                                                    .filter(|(id, _)| {
+                                                        room.should_forward(id, participant_id)
+                                                    })
                                                     .map(|(id, tracks)| {
                                                         (
                                                             id.clone(),
@@ -1345,7 +1427,9 @@ async fn handle_message(
                                         let all_track_ids: Vec<String> = room
                                             .participant_tracks
                                             .iter()
-                                            .filter(|(id, _)| *id != &participant_id_for_retry)
+                                            .filter(|(id, _)| {
+                                                room.should_forward(id, &participant_id_for_retry)
+                                            })
                                             .flat_map(|(_, tracks)| tracks)
                                             .map(|track_info| track_info.track.id().to_string())
                                             .collect();
@@ -1545,10 +1629,9 @@ async fn handle_message(
         }
 
         SignalingMessage::ChatMessage {
-            participant_id: _,
-            participant_name: _,
             message,
-            timestamp: _,
+            reply_to_id,
+            ..
         } => {
             if let Some(room_id) = current_room_id {
                 if let Some(room_lock) = room_repo.get_room(room_id).await {
@@ -1557,24 +1640,15 @@ async fn handle_message(
                         return;
                     }
 
-                    let now = Instant::now();
-                    while recent_chat_messages
-                        .front()
-                        .is_some_and(|sent_at| now.duration_since(*sent_at) >= CHAT_RATE_WINDOW)
-                    {
-                        recent_chat_messages.pop_front();
-                    }
-                    if recent_chat_messages.len() >= CHAT_RATE_LIMIT {
-                        warn!("Rate-limited chat message from {}", participant_id);
-                        return;
-                    }
-
                     let message = message.trim();
                     if message.is_empty() || message.chars().count() > 2_000 {
                         warn!("Rejected invalid chat message from {}", participant_id);
                         return;
                     }
-                    recent_chat_messages.push_back(now);
+                    if !allow_sender_chat_action(recent_chat_messages) {
+                        warn!("Rate-limited chat message from {}", participant_id);
+                        return;
+                    }
 
                     if !room.allow_chat_message() {
                         warn!("Rate-limited chat messages in room {}", room_id);
@@ -1592,16 +1666,43 @@ async fn handle_message(
                         participant_name: sender_name.clone(),
                         message: message.to_string(),
                         timestamp,
+                        // A quote of a message that has left the history is dropped, not rejected.
+                        reply_to: reply_to_id.and_then(|id| room.chat_reply_preview(id)),
+                        ..ChatMessagePayload::default()
                     };
 
                     info!("💬 {} sent message in room {}", sender_name, room_id);
-                    room.record_chat_message(chat_message.clone());
-                    room.broadcast(SignalingMessage::ChatMessage {
-                        participant_id: chat_message.participant_id,
-                        participant_name: chat_message.participant_name,
-                        message: chat_message.message,
-                        timestamp: chat_message.timestamp,
-                    });
+                    let chat_message = room.record_chat_message(chat_message);
+                    room.broadcast(chat_message.into_signaling_message());
+                }
+            }
+        }
+
+        SignalingMessage::ChatReaction { message_id, emoji } => {
+            let Ok(emoji) = crate::social::validate_reaction(&emoji) else {
+                warn!("Rejected invalid chat reaction from {}", participant_id);
+                return;
+            };
+            if let Some(room_id) = current_room_id {
+                if let Some(room_lock) = room_repo.get_room(room_id).await {
+                    let mut room = room_lock.write().await;
+                    if !room.has_active_participant(participant_id, session_user_id) {
+                        return;
+                    }
+                    // Reactions share the sender's chat budget, so toggling cannot flood the room.
+                    if !allow_sender_chat_action(recent_chat_messages) {
+                        warn!("Rate-limited chat reaction from {}", participant_id);
+                        return;
+                    }
+
+                    if let Some(reactions) =
+                        room.toggle_chat_reaction(message_id, participant_id, &emoji)
+                    {
+                        room.broadcast(SignalingMessage::ChatReactionsChanged {
+                            message_id,
+                            reactions,
+                        });
+                    }
                 }
             }
         }
