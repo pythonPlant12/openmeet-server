@@ -303,7 +303,7 @@ async fn reaction_summaries(
     Ok(summaries)
 }
 
-fn excerpt(content: &str) -> String {
+pub(crate) fn excerpt(content: &str) -> String {
     let mut characters = content.chars();
     let mut preview: String = characters.by_ref().take(REPLY_PREVIEW_CHARACTERS).collect();
     if characters.next().is_some() {
@@ -313,7 +313,7 @@ fn excerpt(content: &str) -> String {
 }
 
 /// Reactions are emoji: short, with no letters, spaces, or control characters.
-fn validate_reaction(emoji: &str) -> Result<String, (StatusCode, String)> {
+pub(crate) fn validate_reaction(emoji: &str) -> Result<String, (StatusCode, String)> {
     let emoji = emoji.trim();
     let valid = !emoji.is_empty()
         && emoji.len() <= MAX_REACTION_BYTES

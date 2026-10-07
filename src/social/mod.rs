@@ -4,6 +4,9 @@ mod conversations;
 mod events;
 mod group_invitations;
 mod handlers;
+mod link_previews;
+mod meeting_rooms;
+mod meetings;
 mod messages;
 mod models;
 mod notifications;
@@ -17,6 +20,9 @@ pub use call_sessions::{
 pub use conversations::conversation_routes;
 pub use events::{SocialEventHub, SocialResource, social_events_handler};
 pub use handlers::social_routes;
+pub use meeting_rooms::{MeetingRoomAdmission, admit_to_meeting_room};
+pub use meetings::MeetingRecorder;
+pub(crate) use messages::{excerpt as message_excerpt, validate_reaction};
 pub(crate) use notifications::{create_notification, notification_routes};
 
 pub(crate) fn has_matching_if_none_match(headers: &HeaderMap, etag: &str) -> bool {

@@ -20,7 +20,7 @@ use auth::{JwtConfig, auth_routes};
 use db::DbPool;
 use sfu::repository::RoomRepository;
 use signaling::handler::websocket_handler;
-use social::{SocialEventHub, social_routes};
+use social::{MeetingRecorder, SocialEventHub, social_routes};
 use storage::AvatarStorage;
 
 #[derive(Clone)]
@@ -32,6 +32,7 @@ pub struct AppState {
     pub enforce_room_access: bool,
     pub avatar_storage: Arc<dyn AvatarStorage>,
     pub social_events: SocialEventHub,
+    pub meeting_recorder: MeetingRecorder,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<dyn RoomRepository> {

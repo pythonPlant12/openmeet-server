@@ -2198,7 +2198,7 @@ fn validate_password_for_policy(
     }
 }
 
-async fn hash_group_password(
+pub(super) async fn hash_group_password(
     password: Option<String>,
 ) -> Result<Option<String>, (StatusCode, String)> {
     let Some(password) = password else {
@@ -2216,7 +2216,7 @@ async fn hash_group_password(
     Ok(Some(password_hash))
 }
 
-async fn verify_group_password(
+pub(super) async fn verify_group_password(
     password_hash: Option<String>,
     password: Option<String>,
 ) -> Result<bool, (StatusCode, String)> {
