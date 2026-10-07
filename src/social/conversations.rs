@@ -27,7 +27,8 @@ use crate::{
     auth::extract_user_id,
     schema::{
         call_session_members, call_sessions, conversation_hidden_states, conversation_members,
-        conversations, direct_message_requests, friendships, revoked_sfu_rooms, users,
+        conversation_message_attachments, conversation_messages, conversations,
+        direct_message_requests, friendships, revoked_sfu_rooms, users,
     },
     social::{
         SocialResource,
@@ -38,8 +39,8 @@ use crate::{
             validated_user_search_query,
         },
         messages::{
-            create_message, list_messages, mark_conversation_read, mark_conversation_unread,
-            toggle_message_reaction,
+            create_message, create_message_with_attachments, get_message_attachment, list_messages,
+            mark_conversation_read, mark_conversation_unread, toggle_message_reaction,
         },
         models::{
             AddConversationMemberRequest, Conversation, ConversationKind, ConversationMember,
@@ -140,6 +141,16 @@ pub fn conversation_routes() -> Router<AppState> {
             post(respond_to_direct_message_request),
         )
         .route("/{id}/messages", get(list_messages).post(create_message))
+        .route(
+            "/{id}/messages/attachments",
+            post(create_message_with_attachments).layer(DefaultBodyLimit::max(
+                crate::social::messages::MAX_ATTACHMENT_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/{id}/attachments/{attachment_id}",
+            get(get_message_attachment),
+        )
         .route(
             "/{id}/messages/{sequence}/reactions",
             post(toggle_message_reaction),
@@ -860,8 +871,17 @@ async fn delete_group(
 ) -> EmptyResult {
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let deletion: Result<(Vec<Uuid>, Vec<Uuid>, Vec<String>, Option<String>), ConversationError> =
-        conn.transaction(|conn| {
+    let deletion: Result<
+        (
+            Vec<Uuid>,
+            Vec<Uuid>,
+            Vec<String>,
+            Option<String>,
+            Vec<String>,
+        ),
+        ConversationError,
+    > = conn
+        .transaction(|conn| {
             async move {
                 let (group, role) = require_group_admin_for_update(conn, group_id, user_id).await?;
                 if !can_delete_group(&role) {
@@ -884,6 +904,15 @@ async fn delete_group(
                     .select(call_sessions::sfu_room_id)
                     .load::<String>(conn)
                     .await?;
+                let attachment_keys = conversation_message_attachments::table
+                    .inner_join(
+                        conversation_messages::table.on(conversation_messages::sequence
+                            .eq(conversation_message_attachments::message_sequence)),
+                    )
+                    .filter(conversation_messages::conversation_id.eq(group_id))
+                    .select(conversation_message_attachments::storage_key)
+                    .load::<String>(conn)
+                    .await?;
                 let tombstones = sfu_room_ids
                     .iter()
                     .map(|sfu_room_id| NewRevokedSfuRoom { sfu_room_id })
@@ -898,12 +927,18 @@ async fn delete_group(
                 diesel::delete(conversations::table.find(group_id))
                     .execute(conn)
                     .await?;
-                Ok((member_ids, call_recipients, sfu_room_ids, group.avatar_key))
+                Ok((
+                    member_ids,
+                    call_recipients,
+                    sfu_room_ids,
+                    group.avatar_key,
+                    attachment_keys,
+                ))
             }
             .scope_boxed()
         })
         .await;
-    let (member_ids, call_recipients, sfu_room_ids, avatar_key) =
+    let (member_ids, call_recipients, sfu_room_ids, avatar_key, attachment_keys) =
         deletion.map_err(ConversationError::into_api_error)?;
 
     revoke_and_close_sfu_rooms(&state, &sfu_room_ids).await;
@@ -917,6 +952,11 @@ async fn delete_group(
         && let Err(error) = delete_avatar(state.avatar_storage.as_ref(), &avatar_key).await
     {
         tracing::warn!(%error, %group_id, %avatar_key, "Failed to remove deleted group avatar");
+    }
+    for attachment_key in attachment_keys {
+        if let Err(error) = state.avatar_storage.delete(&attachment_key).await {
+            tracing::warn!(%error, %group_id, %attachment_key, "Failed to remove deleted group attachment");
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }

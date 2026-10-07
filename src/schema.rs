@@ -63,6 +63,20 @@ diesel::table! {
 }
 
 diesel::table! {
+    conversation_message_attachments (id) {
+        id -> Uuid,
+        message_sequence -> Int8,
+        storage_key -> Text,
+        #[max_length = 255]
+        file_name -> Varchar,
+        #[max_length = 255]
+        content_type -> Varchar,
+        byte_size -> Int8,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     meeting_participants (id) {
         id -> Uuid,
         meeting_session_id -> Uuid,
@@ -286,6 +300,7 @@ diesel::joinable!(refresh_tokens -> users (user_id));
 diesel::joinable!(conversation_members -> conversations (conversation_id));
 diesel::joinable!(conversation_messages -> conversations (conversation_id));
 diesel::joinable!(conversation_messages -> users (sender_id));
+diesel::joinable!(conversation_message_attachments -> conversation_messages (message_sequence));
 diesel::joinable!(conversation_hidden_states -> conversations (conversation_id));
 diesel::joinable!(conversation_hidden_states -> users (user_id));
 diesel::joinable!(conversation_read_states -> conversations (conversation_id));
@@ -307,6 +322,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     call_session_members,
     call_sessions,
     conversation_members,
+    conversation_message_attachments,
     conversation_messages,
     conversation_hidden_states,
     conversation_read_states,
