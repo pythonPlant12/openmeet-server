@@ -803,6 +803,7 @@ pub struct MessageReactionSummary {
 pub struct ConversationMessagesResponse {
     pub messages: Vec<ConversationMessageResponse>,
     pub next_before: Option<i64>,
+    pub first_unread_sequence: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]

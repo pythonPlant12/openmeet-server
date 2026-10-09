@@ -52,6 +52,7 @@ pub fn meeting_session_routes() -> Router<AppState> {
         .route("/", get(list_meeting_sessions))
         .route("/{id}", get(get_meeting_session))
         .route("/{id}/read", post(mark_meeting_read))
+        .route("/{id}/unread", post(mark_meeting_unread))
         .route("/rooms/{room_ref}/summary", get(get_room_summary))
         .route("/rooms/{room_id}/presence", get(get_room_presence))
 }
@@ -943,6 +944,46 @@ async fn mark_meeting_read(
         .await
         .map_err(internal_error)?;
     // Other open tabs update their dot and badge.
+    state
+        .social_events
+        .publish([user_id], SocialResource::Calls);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Only missed calls may be returned to unread. Attended or responded calls are never unread events.
+async fn mark_meeting_unread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let room_id = meeting_sessions::table
+        .find(session_id)
+        .select(meeting_sessions::sfu_room_id)
+        .first::<String>(&mut conn)
+        .await
+        .optional()
+        .map_err(internal_error)?
+        .ok_or_else(meeting_not_found)?;
+    let Some(call) = missed_calls(&mut conn, user_id, vec![room_id])
+        .await?
+        .into_values()
+        .next()
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Only missed calls can be unread".to_string(),
+        ));
+    };
+    diesel::delete(
+        call_read_states::table
+            .filter(call_read_states::call_session_id.eq(call.call_session_id))
+            .filter(call_read_states::user_id.eq(user_id)),
+    )
+    .execute(&mut conn)
+    .await
+    .map_err(internal_error)?;
     state
         .social_events
         .publish([user_id], SocialResource::Calls);
