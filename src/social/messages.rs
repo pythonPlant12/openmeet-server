@@ -22,7 +22,7 @@ use crate::{
     auth::extract_user_id,
     schema::{
         conversation_hidden_states, conversation_members, conversation_message_attachments,
-        conversation_messages, conversations, message_reactions, users,
+        conversation_messages, conversation_read_states, conversations, message_reactions, users,
     },
     social::{
         SocialResource,
@@ -309,6 +309,7 @@ pub(crate) async fn get_message_attachment(
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
     authorize_conversation_access(&mut conn, conversation_id, user_id).await?;
+
     let attachment = conversation_message_attachments::table
         .inner_join(conversation_messages::table.on(
             conversation_messages::sequence.eq(conversation_message_attachments::message_sequence),
@@ -571,6 +572,29 @@ pub(crate) async fn list_messages(
     let mut conn = state.pool.get().await.map_err(internal_error)?;
     authorize_conversation_access(&mut conn, conversation_id, user_id).await?;
 
+    // Capture this before reading the latest page advances the read state. The client needs the
+    // exact boundary even when the unread range spans more than one history page.
+    let first_unread_sequence = if is_latest_page {
+        let last_read_sequence = conversation_read_states::table
+            .find((conversation_id, user_id))
+            .select(conversation_read_states::last_read_sequence)
+            .first::<i64>(&mut conn)
+            .await
+            .optional()
+            .map_err(internal_error)?
+            .unwrap_or(0);
+        conversation_messages::table
+            .filter(conversation_messages::conversation_id.eq(conversation_id))
+            .filter(conversation_messages::sender_id.ne(user_id))
+            .filter(conversation_messages::sequence.gt(last_read_sequence))
+            .select(diesel::dsl::min(conversation_messages::sequence))
+            .first::<Option<i64>>(&mut conn)
+            .await
+            .map_err(internal_error)?
+    } else {
+        None
+    };
+
     let mut message_query = conversation_messages::table
         .filter(conversation_messages::conversation_id.eq(conversation_id))
         .into_boxed();
@@ -632,6 +656,7 @@ pub(crate) async fn list_messages(
             })
             .collect(),
         next_before,
+        first_unread_sequence,
     }))
 }
 
