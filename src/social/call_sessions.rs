@@ -21,9 +21,9 @@ use crate::{
     AppState,
     auth::extract_user_id,
     db::DbPool,
-    schema::{call_session_members, call_sessions, conversation_members, conversations},
+    schema::{call_session_members, call_sessions, conversation_members, conversations, users},
     social::{
-        SocialResource,
+        AlertCallKind, SocialAlert, SocialResource,
         models::{
             CallSession, CallSessionJoinResponse, CallSessionMember, CallSessionResponse,
             CallSessionStartResponse, Conversation, IncomingCallSessionResponse, NewCallSession,
@@ -115,7 +115,7 @@ pub async fn start_call_session(
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let now = Utc::now();
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let (session, recipients): (CallSession, Vec<Uuid>) = conn
+    let (session, recipients, conversation_title): (CallSession, Vec<Uuid>, Option<String>) = conn
         .transaction(|conn| {
             async move {
                 let conversation = load_conversation_for_update(conn, conversation_id).await?;
@@ -175,7 +175,7 @@ pub async fn start_call_session(
                     .execute(conn)
                     .await?;
 
-                Ok((session, participant_ids))
+                Ok((session, participant_ids, conversation.title))
             }
             .scope_boxed()
         })
@@ -184,13 +184,74 @@ pub async fn start_call_session(
 
     state
         .social_events
-        .publish(recipients, SocialResource::Calls);
+        .publish(recipients.iter().copied(), SocialResource::Calls);
+    alert_incoming_call(
+        &state,
+        &mut conn,
+        user_id,
+        recipients
+            .into_iter()
+            .filter(|recipient| *recipient != user_id),
+        IncomingCallAlert {
+            call_id: session.id,
+            call_kind: AlertCallKind::Session,
+            conversation_id: Some(conversation_id),
+            conversation_title,
+            expires_at: session.expires_at,
+        },
+    )
+    .await;
 
     Ok(Json(CallSessionStartResponse {
         id: session.id,
         room_id: session.sfu_room_id,
         expires_at: session.expires_at,
     }))
+}
+
+pub(crate) struct IncomingCallAlert {
+    pub call_id: Uuid,
+    pub call_kind: AlertCallKind,
+    pub conversation_id: Option<Uuid>,
+    pub conversation_title: Option<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Rings the callees' devices. Runs after the call is saved, so a failure here only logs.
+pub(crate) async fn alert_incoming_call(
+    state: &AppState,
+    conn: &mut AsyncPgConnection,
+    caller_id: Uuid,
+    callees: impl IntoIterator<Item = Uuid>,
+    call: IncomingCallAlert,
+) {
+    let caller_name = match users::table
+        .find(caller_id)
+        .select(users::name)
+        .first::<String>(conn)
+        .await
+    {
+        Ok(name) => name,
+        Err(error) => {
+            tracing::warn!(%error, call_id = %call.call_id, "Failed to load caller for call alert");
+            return;
+        }
+    };
+    state
+        .social_events
+        .alert(
+            conn,
+            callees,
+            SocialAlert::IncomingCall {
+                call_id: call.call_id,
+                call_kind: call.call_kind,
+                caller_name,
+                conversation_id: call.conversation_id,
+                conversation_title: call.conversation_title,
+                expires_at: call.expires_at,
+            },
+        )
+        .await;
 }
 
 async fn list_incoming_call_sessions(

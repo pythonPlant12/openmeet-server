@@ -14,7 +14,9 @@ use diesel::{
     sql_query,
     sql_types::{Array, BigInt, Bool, Text, Uuid as SqlUuid},
 };
-use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
+use diesel_async::{
+    AsyncConnection, AsyncPgConnection, RunQueryDsl, scoped_futures::ScopedFutureExt,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -25,7 +27,7 @@ use crate::{
         conversation_messages, conversation_read_states, conversations, message_reactions, users,
     },
     social::{
-        SocialResource,
+        SocialAlert, SocialResource,
         models::{
             Conversation, ConversationMessage, ConversationMessageAttachment,
             ConversationMessageResponse, ConversationMessagesResponse,
@@ -154,7 +156,8 @@ pub(crate) async fn create_message(
 
     state
         .social_events
-        .publish(recipients, SocialResource::Conversations);
+        .publish(recipients.iter().copied(), SocialResource::Conversations);
+    alert_new_message(&state, &mut conn, &message, &recipients, false).await;
 
     let reply_to = match message.reply_to_sequence {
         Some(sequence) => reply_previews(&mut conn, conversation_id, &[sequence])
@@ -282,7 +285,15 @@ pub(crate) async fn create_message_with_attachments(
 
     state
         .social_events
-        .publish(recipients, SocialResource::Conversations);
+        .publish(recipients.iter().copied(), SocialResource::Conversations);
+    alert_new_message(
+        &state,
+        &mut conn,
+        &message,
+        &recipients,
+        !attachment_responses.is_empty(),
+    )
+    .await;
     let reply_to = match message.reply_to_sequence {
         Some(sequence) => reply_previews(&mut conn, conversation_id, &[sequence])
             .await?
@@ -502,6 +513,46 @@ async fn reaction_summaries(
             });
     }
     Ok(summaries)
+}
+
+/// Alerts the other participants about a new message. Runs after the commit, so a failure here
+/// never fails the send.
+async fn alert_new_message(
+    state: &AppState,
+    conn: &mut AsyncPgConnection,
+    message: &ConversationMessage,
+    participants: &[Uuid],
+    has_attachments: bool,
+) {
+    let conversation_title = conversations::table
+        .find(message.conversation_id)
+        .select(conversations::title)
+        .first::<Option<String>>(conn)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, conversation_id = %message.conversation_id, "Failed to load conversation title for alert");
+            None
+        });
+    let recipients = participants
+        .iter()
+        .copied()
+        .filter(|participant_id| *participant_id != message.sender_id);
+    state
+        .social_events
+        .alert(
+            conn,
+            recipients,
+            SocialAlert::Message {
+                conversation_id: message.conversation_id,
+                sequence: message.sequence,
+                sender_id: message.sender_id,
+                sender_name: message.sender_name.clone(),
+                conversation_title,
+                preview: excerpt(&message.content),
+                has_attachments,
+            },
+        )
+        .await;
 }
 
 pub(crate) fn excerpt(content: &str) -> String {
