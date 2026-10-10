@@ -8,6 +8,9 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use chrono::{DateTime, Utc};
+use diesel::prelude::*;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -16,7 +19,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, schema::users, social::models::UserStatus};
 
 const EVENT_CAPACITY: usize = 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,10 +39,53 @@ pub enum SocialResource {
     Notifications,
 }
 
+/// Something the user should hear about even when OpenMeet is not in front of them. Clients show
+/// it as an OS notification. Push delivery can reuse the same payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SocialAlert {
+    Message {
+        conversation_id: Uuid,
+        sequence: i64,
+        sender_id: Uuid,
+        sender_name: String,
+        /// Group title; `None` for direct conversations.
+        conversation_title: Option<String>,
+        preview: String,
+        has_attachments: bool,
+    },
+    IncomingCall {
+        call_id: Uuid,
+        call_kind: AlertCallKind,
+        caller_name: String,
+        conversation_id: Option<Uuid>,
+        conversation_title: Option<String>,
+        expires_at: DateTime<Utc>,
+    },
+}
+
+/// Which endpoint answers the call: `/social/calls/{id}/respond` or `/call-sessions/{id}/respond`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AlertCallKind {
+    Invitation,
+    Session,
+}
+
+#[derive(Clone, Debug)]
+enum SocialEventPayload {
+    Refresh(SocialResource),
+    Alert(Arc<SocialAlert>),
+}
+
 #[derive(Clone, Debug)]
 struct SocialEvent {
     recipients: Arc<[Uuid]>,
-    resource: SocialResource,
+    payload: SocialEventPayload,
 }
 
 #[derive(Deserialize)]
@@ -54,10 +100,11 @@ enum ClientMessage {
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-enum ServerMessage {
+enum ServerMessage<'a> {
     Authenticated,
     Error { message: &'static str },
     Refresh { resource: SocialResource },
+    Alert { alert: &'a SocialAlert },
 }
 
 impl SocialEventHub {
@@ -67,13 +114,43 @@ impl SocialEventHub {
     }
 
     pub fn publish(&self, recipients: impl IntoIterator<Item = Uuid>, resource: SocialResource) {
+        self.send(recipients, SocialEventPayload::Refresh(resource));
+    }
+
+    /// Sends `alert` to the recipients whose status is Online. Away, Do not disturb, Sleeping, and
+    /// Appear offline mean the user does not want to be interrupted, so they get no alert. The
+    /// alert is best effort: a failed status lookup only logs, because the change it reports is
+    /// already saved and the refresh event still reaches the client.
+    pub async fn alert(
+        &self,
+        conn: &mut AsyncPgConnection,
+        recipients: impl IntoIterator<Item = Uuid>,
+        alert: SocialAlert,
+    ) {
+        let recipients = recipients.into_iter().collect::<Vec<_>>();
+        if recipients.is_empty() {
+            return;
+        }
+        let available = users::table
+            .filter(users::id.eq_any(&recipients))
+            .filter(users::status.eq(UserStatus::Available.as_db_value()))
+            .select(users::id)
+            .load::<Uuid>(conn)
+            .await;
+        match available {
+            Ok(available) => self.send(available, SocialEventPayload::Alert(Arc::new(alert))),
+            Err(error) => tracing::warn!(%error, "Failed to load alert recipients"),
+        }
+    }
+
+    fn send(&self, recipients: impl IntoIterator<Item = Uuid>, payload: SocialEventPayload) {
         let recipients = recipients.into_iter().collect::<Vec<_>>();
         if recipients.is_empty() {
             return;
         }
         let _ = self.sender.send(SocialEvent {
             recipients: recipients.into(),
-            resource,
+            payload,
         });
     }
 
@@ -124,7 +201,11 @@ async fn handle_socket(state: AppState, mut socket: WebSocket) {
             },
             event = events.recv() => match event {
                 Ok(event) if event.recipients.contains(&user_id) => {
-                    let Ok(payload) = serde_json::to_string(&ServerMessage::Refresh { resource: event.resource }) else {
+                    let message = match &event.payload {
+                        SocialEventPayload::Refresh(resource) => ServerMessage::Refresh { resource: *resource },
+                        SocialEventPayload::Alert(alert) => ServerMessage::Alert { alert },
+                    };
+                    let Ok(payload) = serde_json::to_string(&message) else {
                         continue;
                     };
                     if sender.send(Message::Text(payload.into())).await.is_err() {
@@ -132,6 +213,7 @@ async fn handle_socket(state: AppState, mut socket: WebSocket) {
                     }
                 }
                 Ok(_) => {}
+                // Missed alerts are not replayed: they are only worth showing when they are new.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     for resource in [SocialResource::Calls, SocialResource::Conversations, SocialResource::Friends, SocialResource::Notifications] {
                         let Ok(payload) = serde_json::to_string(&ServerMessage::Refresh { resource }) else {
@@ -221,7 +303,7 @@ async fn authenticate(state: &AppState, socket: &mut WebSocket) -> Option<(Uuid,
     }
 }
 
-async fn send_message(socket: &mut WebSocket, message: &ServerMessage) -> Result<(), ()> {
+async fn send_message(socket: &mut WebSocket, message: &ServerMessage<'_>) -> Result<(), ()> {
     let payload = serde_json::to_string(message).map_err(|_| ())?;
     socket
         .send(Message::Text(payload.into()))
@@ -234,7 +316,10 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
     use uuid::Uuid;
 
-    use super::{ClientMessage, SocialEventHub, SocialResource, is_allowed_origin};
+    use super::{
+        AlertCallKind, ClientMessage, ServerMessage, SocialAlert, SocialEventHub,
+        SocialEventPayload, SocialResource, is_allowed_origin,
+    };
 
     #[tokio::test]
     async fn publishes_targeted_resource_events() {
@@ -246,7 +331,31 @@ mod tests {
 
         let event = receiver.recv().await.unwrap();
         assert_eq!(event.recipients.as_ref(), &[recipient]);
-        assert_eq!(event.resource, SocialResource::Friends);
+        assert!(matches!(
+            event.payload,
+            SocialEventPayload::Refresh(SocialResource::Friends)
+        ));
+    }
+
+    #[test]
+    fn serializes_alerts_with_camel_case_kind_and_fields() {
+        let call_id = Uuid::nil();
+        let alert = SocialAlert::IncomingCall {
+            call_id,
+            call_kind: AlertCallKind::Session,
+            caller_name: "Ada".to_string(),
+            conversation_id: None,
+            conversation_title: None,
+            expires_at: chrono::DateTime::UNIX_EPOCH,
+        };
+
+        let json = serde_json::to_value(ServerMessage::Alert { alert: &alert }).unwrap();
+
+        assert_eq!(json["type"], "alert");
+        assert_eq!(json["alert"]["kind"], "incomingCall");
+        assert_eq!(json["alert"]["callKind"], "session");
+        assert_eq!(json["alert"]["callerName"], "Ada");
+        assert_eq!(json["alert"]["callId"], call_id.to_string());
     }
 
     #[test]

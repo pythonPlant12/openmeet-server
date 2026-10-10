@@ -21,7 +21,7 @@ use crate::{
     auth::{extract_user_id, models::User},
     schema::{call_invitations, friendships, meeting_history, notifications, user_presence, users},
     social::{
-        SocialResource,
+        AlertCallKind, IncomingCallAlert, SocialResource, alert_incoming_call,
         avatars::{AvatarQuery, avatar_response, delete_avatar, store_avatar, user_avatar_url},
         conversation_routes, create_notification,
         models::{
@@ -877,6 +877,20 @@ pub async fn create_call_invitation(
         [invitation.caller_id, invitation.callee_id],
         SocialResource::Calls,
     );
+    alert_incoming_call(
+        &state,
+        &mut conn,
+        invitation.caller_id,
+        [invitation.callee_id],
+        IncomingCallAlert {
+            call_id: invitation.id,
+            call_kind: AlertCallKind::Invitation,
+            conversation_id: None,
+            conversation_title: None,
+            expires_at: invitation.expires_at,
+        },
+    )
+    .await;
     Ok(Json(call_response(invitation, None)))
 }
 
