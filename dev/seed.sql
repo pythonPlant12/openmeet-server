@@ -64,6 +64,9 @@ ON CONFLICT (id) DO UPDATE SET
     nickname = EXCLUDED.nickname,
     password_hash = EXCLUDED.password_hash;
 
+-- test@test.com signs in to the admin panel in development.
+UPDATE users SET role = 'admin' WHERE id = '00000000-0000-0000-0000-000000000001';
+
 UPDATE users
 SET avatar_key = 'dev/avatars/' || nickname || '.svg'
 WHERE id BETWEEN '00000000-0000-0000-0000-000000000007'::uuid

@@ -18,6 +18,7 @@ use crate::auth::{
         AuthResponse, LoginRequest, NewRefreshToken, NewUser, RefreshRequest, RegisterRequest,
         TokenResponse, User, UserResponse,
     },
+    permissions::{Permission, has_permission, require_permission},
 };
 use crate::schema::{refresh_tokens, users};
 
@@ -116,6 +117,8 @@ pub async fn login(
         .verify_password(req.password.as_bytes(), &parsed_hash)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()))?;
 
+    require_permission(&mut conn, user.id, Permission::AppLogin).await?;
+
     // Create tokens
     let (access_token, refresh_token) = create_tokens(&state.jwt, &user, &mut conn).await?;
 
@@ -167,6 +170,21 @@ pub async fn refresh(
         return Err((
             StatusCode::UNAUTHORIZED,
             "Refresh token expired".to_string(),
+        ));
+    }
+
+    // A role that loses app.login ends every session at its next refresh.
+    let can_login = has_permission(&mut conn, user_id, Permission::AppLogin)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !can_login {
+        diesel::delete(refresh_tokens::table.filter(refresh_tokens::user_id.eq(user_id)))
+            .execute(&mut conn)
+            .await
+            .ok();
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "This account is suspended".to_string(),
         ));
     }
 

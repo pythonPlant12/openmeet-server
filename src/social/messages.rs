@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::extract_user_id,
+    auth::{Permission, extract_user_id, require_permission},
     schema::{
         conversation_hidden_states, conversation_members, conversation_message_attachments,
         conversation_messages, conversation_read_states, conversations, message_reactions, users,
@@ -106,6 +106,7 @@ pub(crate) async fn create_message(
     let content = validate_message_content(&request.content)?;
     let reply_to_sequence = request.reply_to_sequence;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
+    require_permission(&mut conn, user_id, Permission::MessagesSend).await?;
 
     let (message, sender_nickname, recipients): (ConversationMessage, String, Vec<Uuid>) = conn
         .transaction(|conn| {
@@ -187,6 +188,7 @@ pub(crate) async fn create_message_with_attachments(
     // Check membership before accepting or writing attachment data.
     {
         let mut conn = state.pool.get().await.map_err(internal_error)?;
+        require_permission(&mut conn, user_id, Permission::MessagesSend).await?;
         authorize_conversation_access(&mut conn, conversation_id, user_id).await?;
     }
     let (content, reply_to_sequence, pending_attachments) =

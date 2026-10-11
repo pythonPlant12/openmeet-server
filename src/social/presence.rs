@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Clients heartbeat presence more often than this, so a newer timestamp means the user is online.
-const ONLINE_WINDOW_SECONDS: i64 = 45;
+pub(crate) const ONLINE_WINDOW_SECONDS: i64 = 45;
 
 /// Who can see a user's online state and status.
 #[allow(dead_code)] // Everyone, Contacts, and Nobody become reachable once users pick a setting.
