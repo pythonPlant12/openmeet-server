@@ -24,6 +24,8 @@ use crate::{
     schema::{call_session_members, call_sessions, conversation_members, conversations, users},
     social::{
         AlertCallKind, SocialAlert, SocialResource,
+        avatars::user_avatar_url,
+        conversations::group_avatar_url,
         models::{
             CallSession, CallSessionJoinResponse, CallSessionMember, CallSessionResponse,
             CallSessionStartResponse, Conversation, IncomingCallSessionResponse, NewCallSession,
@@ -225,17 +227,37 @@ pub(crate) async fn alert_incoming_call(
     callees: impl IntoIterator<Item = Uuid>,
     call: IncomingCallAlert,
 ) {
-    let caller_name = match users::table
+    let (caller_name, caller_avatar_key) = match users::table
         .find(caller_id)
-        .select(users::name)
-        .first::<String>(conn)
+        .select((users::name, users::avatar_key))
+        .first::<(String, Option<String>)>(conn)
         .await
     {
-        Ok(name) => name,
+        Ok(caller) => caller,
         Err(error) => {
             tracing::warn!(%error, call_id = %call.call_id, "Failed to load caller for call alert");
             return;
         }
+    };
+    let avatar_url = match call.conversation_id {
+        Some(conversation_id) => conversations::table
+            .find(conversation_id)
+            .first::<Conversation>(conn)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(%error, call_id = %call.call_id, "Failed to load group for call alert");
+            })
+            .ok()
+            .and_then(|conversation| {
+                if conversation.kind == "group" {
+                    group_avatar_url(&conversation)
+                } else {
+                    caller_avatar_key
+                        .as_deref()
+                        .map(|key| user_avatar_url(caller_id, key))
+                }
+            }),
+        None => caller_avatar_key.map(|key| user_avatar_url(caller_id, &key)),
     };
     state
         .social_events
@@ -248,6 +270,7 @@ pub(crate) async fn alert_incoming_call(
                 caller_name,
                 conversation_id: call.conversation_id,
                 conversation_title: call.conversation_title,
+                avatar_url,
                 expires_at: call.expires_at,
             },
         )
