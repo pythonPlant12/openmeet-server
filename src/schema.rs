@@ -270,6 +270,36 @@ diesel::table! {
 }
 
 diesel::table! {
+    permissions (key) {
+        #[max_length = 64]
+        key -> Varchar,
+        #[max_length = 255]
+        description -> Varchar,
+    }
+}
+
+diesel::table! {
+    role_permissions (role_name, permission_key) {
+        #[max_length = 50]
+        role_name -> Varchar,
+        #[max_length = 64]
+        permission_key -> Varchar,
+    }
+}
+
+diesel::table! {
+    roles (name) {
+        #[max_length = 50]
+        name -> Varchar,
+        #[max_length = 255]
+        description -> Varchar,
+        is_system -> Bool,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     refresh_tokens (id) {
         id -> Uuid,
         user_id -> Uuid,
@@ -315,6 +345,9 @@ diesel::joinable!(meeting_participants -> meeting_sessions (meeting_session_id))
 diesel::joinable!(meeting_participants -> users (user_id));
 diesel::joinable!(meeting_room_invitations -> meeting_rooms (room_id));
 diesel::joinable!(meeting_rooms -> users (owner_id));
+diesel::joinable!(role_permissions -> permissions (permission_key));
+diesel::joinable!(role_permissions -> roles (role_name));
+diesel::joinable!(users -> roles (role));
 
 diesel::allow_tables_to_appear_in_same_query!(
     call_invitations,
@@ -337,8 +370,11 @@ diesel::allow_tables_to_appear_in_same_query!(
     meeting_sessions,
     message_reactions,
     notifications,
+    permissions,
     refresh_tokens,
     revoked_sfu_rooms,
+    role_permissions,
+    roles,
     user_presence,
     users,
 );

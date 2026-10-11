@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::extract_user_id,
+    auth::{Permission, extract_user_id, require_permission},
     db::DbPool,
     schema::{
         meeting_participants, meeting_room_invitations, meeting_rooms, meeting_sessions, users,
@@ -272,8 +272,9 @@ async fn create_meeting_room(
     Json(request): Json<MeetingRoomSettingsRequest>,
 ) -> ApiResult<MeetingRoomAccessResponse> {
     let user_id = extract_user_id(&state.jwt, &headers)?;
-    let password_hash = validated_password_hash(request.access_policy, request.password).await?;
     let mut conn = state.pool.get().await.map_err(internal_error)?;
+    require_permission(&mut conn, user_id, Permission::MeetingsCreate).await?;
+    let password_hash = validated_password_hash(request.access_policy, request.password).await?;
     let room_id = Uuid::new_v4().to_string();
     diesel::insert_into(meeting_rooms::table)
         .values((

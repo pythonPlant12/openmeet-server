@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod auth;
 pub mod db;
 pub mod schema;
@@ -16,6 +17,7 @@ use axum::{
 use metrics_exporter_prometheus::PrometheusHandle;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+use admin::admin_routes;
 use auth::{JwtConfig, auth_routes};
 use db::DbPool;
 use sfu::repository::RoomRepository;
@@ -48,6 +50,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/ws", get(websocket_handler))
         .route("/metrics", get(metrics_handler))
+        .nest("/admin", admin_routes())
         .nest("/auth", auth_routes())
         .nest("/social", social_routes())
         .layer(cors)
