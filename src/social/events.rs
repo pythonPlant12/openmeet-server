@@ -55,6 +55,9 @@ pub enum SocialAlert {
         sender_name: String,
         /// Group title; `None` for direct conversations.
         conversation_title: Option<String>,
+        /// The group's avatar, or the sender's in a direct conversation. Clients fetch it with
+        /// their access token to show it on the notification.
+        avatar_url: Option<String>,
         preview: String,
         has_attachments: bool,
     },
@@ -64,6 +67,8 @@ pub enum SocialAlert {
         caller_name: String,
         conversation_id: Option<Uuid>,
         conversation_title: Option<String>,
+        /// The group's avatar for a group call, otherwise the caller's.
+        avatar_url: Option<String>,
         expires_at: DateTime<Utc>,
     },
 }
@@ -346,6 +351,7 @@ mod tests {
             caller_name: "Ada".to_string(),
             conversation_id: None,
             conversation_title: None,
+            avatar_url: Some("/social/users/x/avatar?v=1".to_string()),
             expires_at: chrono::DateTime::UNIX_EPOCH,
         };
 
@@ -356,6 +362,7 @@ mod tests {
         assert_eq!(json["alert"]["callKind"], "session");
         assert_eq!(json["alert"]["callerName"], "Ada");
         assert_eq!(json["alert"]["callId"], call_id.to_string());
+        assert_eq!(json["alert"]["avatarUrl"], "/social/users/x/avatar?v=1");
     }
 
     #[test]

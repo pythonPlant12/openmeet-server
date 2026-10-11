@@ -89,7 +89,10 @@ VALUES
     ('10000000-0000-0000-0000-000000000013', '00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000005', 'accepted'),
     ('10000000-0000-0000-0000-000000000014', '00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000006', 'accepted'),
     ('10000000-0000-0000-0000-000000000015', '00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000006', 'accepted')
-ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, updated_at = NOW();
+-- Friendships are unique per pair, whoever asked. A pair befriended in the app has its own row ID,
+-- so matching on the pair (which also covers these fixed IDs) keeps reruns from failing.
+ON CONFLICT ((LEAST(requester_id, addressee_id)), (GREATEST(requester_id, addressee_id)))
+DO UPDATE SET status = EXCLUDED.status, updated_at = NOW();
 
 -- test1 through test10 form a complete accepted-friend mesh (45 pairs).
 WITH numbered_users AS (

@@ -28,6 +28,8 @@ use crate::{
     },
     social::{
         SocialAlert, SocialResource,
+        avatars::user_avatar_url,
+        conversations::group_avatar_url,
         models::{
             Conversation, ConversationMessage, ConversationMessageAttachment,
             ConversationMessageResponse, ConversationMessagesResponse,
@@ -557,15 +559,19 @@ async fn alert_new_message(
     participants: &[Uuid],
     has_attachments: bool,
 ) {
-    let conversation_title = conversations::table
+    let conversation = conversations::table
         .find(message.conversation_id)
-        .select(conversations::title)
-        .first::<Option<String>>(conn)
+        .first::<Conversation>(conn)
         .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, conversation_id = %message.conversation_id, "Failed to load conversation title for alert");
-            None
-        });
+        .inspect_err(|error| {
+            tracing::warn!(%error, conversation_id = %message.conversation_id, "Failed to load conversation for alert");
+        })
+        .ok();
+    let avatar_url = match &conversation {
+        Some(conversation) if conversation.kind == "group" => group_avatar_url(conversation),
+        _ => sender_avatar_url(conn, message.sender_id).await,
+    };
+    let conversation_title = conversation.and_then(|conversation| conversation.title);
     let recipients = participants
         .iter()
         .copied()
@@ -581,11 +587,26 @@ async fn alert_new_message(
                 sender_id: message.sender_id,
                 sender_name: message.sender_name.clone(),
                 conversation_title,
+                avatar_url,
                 preview: excerpt(&message.content),
                 has_attachments,
             },
         )
         .await;
+}
+
+async fn sender_avatar_url(conn: &mut AsyncPgConnection, sender_id: Uuid) -> Option<String> {
+    users::table
+        .find(sender_id)
+        .select(users::avatar_key)
+        .first::<Option<String>>(conn)
+        .await
+        .inspect_err(
+            |error| tracing::warn!(%error, %sender_id, "Failed to load sender avatar for alert"),
+        )
+        .ok()
+        .flatten()
+        .map(|key| user_avatar_url(sender_id, &key))
 }
 
 pub(crate) fn excerpt(content: &str) -> String {
