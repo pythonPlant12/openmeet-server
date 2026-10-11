@@ -3,6 +3,7 @@ mod badges;
 mod call_sessions;
 mod conversations;
 mod events;
+mod gifs;
 mod group_invitations;
 mod handlers;
 mod link_previews;

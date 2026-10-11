@@ -448,6 +448,31 @@ async fn reply_previews(
         .load(conn)
         .await
         .map_err(internal_error)?;
+    let attachments: Vec<(i64, String)> = conversation_message_attachments::table
+        .inner_join(conversation_messages::table.on(
+            conversation_messages::sequence.eq(conversation_message_attachments::message_sequence),
+        ))
+        .filter(conversation_messages::conversation_id.eq(conversation_id))
+        .filter(conversation_message_attachments::message_sequence.eq_any(sequences))
+        .order((
+            conversation_message_attachments::message_sequence.asc(),
+            conversation_message_attachments::created_at.asc(),
+            conversation_message_attachments::id.asc(),
+        ))
+        .select((
+            conversation_message_attachments::message_sequence,
+            conversation_message_attachments::file_name,
+        ))
+        .load(conn)
+        .await
+        .map_err(internal_error)?;
+    let mut attachment_metadata: HashMap<i64, (String, i64)> = HashMap::new();
+    for (sequence, file_name) in attachments {
+        attachment_metadata
+            .entry(sequence)
+            .and_modify(|(_, count)| *count += 1)
+            .or_insert((file_name, 1));
+    }
     Ok(rows
         .into_iter()
         .map(
@@ -460,6 +485,12 @@ async fn reply_previews(
                         sender_name,
                         sender_nickname,
                         content: excerpt(&content),
+                        attachment_file_name: attachment_metadata
+                            .get(&sequence)
+                            .map(|(file_name, _)| file_name.clone()),
+                        attachment_count: attachment_metadata
+                            .get(&sequence)
+                            .map(|(_, count)| *count),
                     },
                 )
             },

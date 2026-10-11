@@ -2037,7 +2037,7 @@ pub(super) fn conversation_response(
     })
 }
 
-fn group_avatar_url(conversation: &Conversation) -> Option<String> {
+pub(super) fn group_avatar_url(conversation: &Conversation) -> Option<String> {
     conversation
         .avatar_key
         .as_ref()

@@ -93,6 +93,7 @@ pub fn social_routes() -> Router<AppState> {
             "/link-previews",
             crate::social::link_previews::link_preview_routes(),
         )
+        .nest("/gifs", crate::social::gifs::gif_routes())
         .nest("/conversations", conversation_routes())
 }
 
@@ -166,12 +167,20 @@ pub async fn get_user_profile(
     } else {
         ProfileRelationship::None
     };
-    let last_seen_at = if relationship == ProfileRelationship::None {
+    let has_incoming_friend_request = relationship == ProfileRelationship::None
+        && has_incoming_friend_request(&mut conn, user_id, target_user_id).await?;
+    let last_seen_at = if relationship == ProfileRelationship::None && !has_incoming_friend_request
+    {
         None
     } else {
         last_seen_at(&mut conn, target_user_id).await?
     };
-    Ok(Json(profile_response(user, last_seen_at, relationship)?))
+    Ok(Json(profile_response(
+        user,
+        last_seen_at,
+        relationship,
+        has_incoming_friend_request,
+    )?))
 }
 
 pub async fn get_user_avatar(
@@ -217,6 +226,7 @@ pub async fn get_self_profile(
         user,
         last_seen_at,
         ProfileRelationship::Owner,
+        false,
     )?))
 }
 
@@ -294,6 +304,7 @@ pub async fn update_self_profile(
         user,
         None,
         ProfileRelationship::Owner,
+        false,
     )?))
 }
 
@@ -352,6 +363,7 @@ pub async fn upload_avatar(
         user,
         None,
         ProfileRelationship::Owner,
+        false,
     )?))
 }
 
@@ -471,6 +483,17 @@ pub async fn list_friends(
             }
             friends.push(user);
         } else if relationship.addressee_id == user_id {
+            if let Some(presence) = status.and_then(|status| {
+                presence::visible_presence(
+                    related_id,
+                    status,
+                    last_seen_by_user.get(&related_id).copied(),
+                    Relationship::INCOMING_FRIEND_REQUEST,
+                )
+            }) {
+                user.status = Some(presence.status);
+                user.is_online = presence.is_online;
+            }
             incoming_requests.push(FriendRequestItem {
                 id: relationship.id,
                 user,
@@ -1164,6 +1187,7 @@ fn profile_response(
     user: User,
     last_seen_at: Option<DateTime<Utc>>,
     relationship: ProfileRelationship,
+    has_incoming_friend_request: bool,
 ) -> Result<UserProfile, (StatusCode, String)> {
     let status = UserStatus::from_db_value(&user.status).ok_or_else(|| {
         tracing::error!(user_id = %user.id, status = %user.status, "Invalid persisted user status");
@@ -1172,11 +1196,7 @@ fn profile_response(
             "Profile unavailable".to_string(),
         )
     })?;
-    let viewer = match relationship {
-        ProfileRelationship::Owner => Some(Relationship::SELF),
-        ProfileRelationship::Friend => Some(Relationship::FRIEND),
-        ProfileRelationship::None => None,
-    };
+    let viewer = profile_presence_relationship(relationship, has_incoming_friend_request);
     let presence =
         viewer.and_then(|viewer| presence::visible_presence(user.id, status, last_seen_at, viewer));
     let is_public_view = relationship == ProfileRelationship::None;
@@ -1202,9 +1222,27 @@ fn profile_response(
         },
         created_at: user.created_at,
         is_online: presence.is_some_and(|presence| presence.is_online),
-        last_seen_at: presence.and(last_seen_at),
+        last_seen_at: if is_public_view {
+            None
+        } else {
+            presence.and(last_seen_at)
+        },
         relationship,
     })
+}
+
+fn profile_presence_relationship(
+    relationship: ProfileRelationship,
+    has_incoming_friend_request: bool,
+) -> Option<Relationship> {
+    match relationship {
+        ProfileRelationship::Owner => Some(Relationship::SELF),
+        ProfileRelationship::Friend => Some(Relationship::FRIEND),
+        ProfileRelationship::None if has_incoming_friend_request => {
+            Some(Relationship::INCOMING_FRIEND_REQUEST)
+        }
+        ProfileRelationship::None => None,
+    }
 }
 
 fn friend_summary(user: User, presence: Option<presence::VisiblePresence>) -> FriendSummary {
@@ -1385,6 +1423,23 @@ async fn are_friends(
         .map_err(internal_error)
 }
 
+async fn has_incoming_friend_request(
+    conn: &mut diesel_async::AsyncPgConnection,
+    viewer_id: Uuid,
+    requester_id: Uuid,
+) -> Result<bool, (StatusCode, String)> {
+    friendships::table
+        .filter(friendships::status.eq("pending"))
+        .filter(friendships::requester_id.eq(requester_id))
+        .filter(friendships::addressee_id.eq(viewer_id))
+        .select(friendships::id)
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map(|friendship| friendship.is_some())
+        .map_err(internal_error)
+}
+
 fn multipart_error(error: axum::extract::multipart::MultipartError) -> (StatusCode, String) {
     tracing::warn!(%error, "Invalid avatar upload");
     (StatusCode::BAD_REQUEST, "Invalid avatar upload".to_string())
@@ -1433,8 +1488,15 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
 mod tests {
     use super::{
         MAX_AVATAR_BYTES, avatar_extension, has_image_signature, is_valid_room_id, normalize_name,
-        normalize_nickname, normalize_status_message, valid_avatar_size,
+        normalize_nickname, normalize_status_message, profile_response, valid_avatar_size,
         validated_user_search_query,
+    };
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use crate::{
+        auth::models::User,
+        social::models::{ProfileRelationship, UserStatus},
     };
 
     #[test]
@@ -1495,5 +1557,51 @@ mod tests {
             "image/png; charset=binary",
             b"\x89PNG\r\n\x1a\nimage data"
         ));
+    }
+
+    #[test]
+    fn exposes_incoming_request_presence_without_unredacting_profile() {
+        let last_seen_at = Utc::now();
+        let incoming_request = profile_response(
+            profile_test_user(),
+            Some(last_seen_at),
+            ProfileRelationship::None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(incoming_request.relationship, ProfileRelationship::None);
+        assert_eq!(incoming_request.status, UserStatus::Away);
+        assert!(incoming_request.is_online);
+        assert_eq!(incoming_request.email, "");
+        assert_eq!(incoming_request.status_message, "");
+        assert_eq!(incoming_request.last_seen_at, None);
+
+        let outgoing_request = profile_response(
+            profile_test_user(),
+            Some(last_seen_at),
+            ProfileRelationship::None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(outgoing_request.status, UserStatus::Offline);
+        assert!(!outgoing_request.is_online);
+    }
+
+    fn profile_test_user() -> User {
+        let now = Utc::now().naive_utc();
+        User {
+            id: Uuid::new_v4(),
+            email: "ada@example.com".to_string(),
+            name: "Ada Lovelace".to_string(),
+            nickname: "ada".to_string(),
+            avatar_key: None,
+            password_hash: "hash".to_string(),
+            role: "user".to_string(),
+            status: "away".to_string(),
+            status_message: "Working".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
     }
 }

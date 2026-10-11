@@ -35,6 +35,8 @@ pub const DEFAULT_PRESENCE_VISIBILITY: PresenceVisibility = PresenceVisibility::
 pub struct Relationship {
     pub is_self: bool,
     pub is_friend: bool,
+    /// A requester has explicitly asked the viewer to connect, so the viewer may see the requester's presence.
+    pub has_pending_friend_request: bool,
     pub shares_group: bool,
     /// Both people are connected to the same live meeting right now.
     pub shares_meeting: bool,
@@ -44,12 +46,21 @@ impl Relationship {
     pub const FRIEND: Self = Self {
         is_self: false,
         is_friend: true,
+        has_pending_friend_request: false,
+        shares_group: false,
+        shares_meeting: false,
+    };
+    pub const INCOMING_FRIEND_REQUEST: Self = Self {
+        is_self: false,
+        is_friend: false,
+        has_pending_friend_request: true,
         shares_group: false,
         shares_meeting: false,
     };
     pub const SELF: Self = Self {
         is_self: true,
         is_friend: false,
+        has_pending_friend_request: false,
         shares_group: false,
         shares_meeting: false,
     };
@@ -57,6 +68,7 @@ impl Relationship {
     pub const MEETING_PEER: Self = Self {
         is_self: false,
         is_friend: false,
+        has_pending_friend_request: false,
         shares_group: false,
         shares_meeting: true,
     };
@@ -84,8 +96,14 @@ pub fn can_see(visibility: PresenceVisibility, relationship: Relationship) -> bo
     }
     match visibility {
         PresenceVisibility::Everyone => true,
-        PresenceVisibility::Contacts => relationship.is_friend || relationship.shares_group,
-        PresenceVisibility::Friends => relationship.is_friend,
+        PresenceVisibility::Contacts => {
+            relationship.is_friend
+                || relationship.has_pending_friend_request
+                || relationship.shares_group
+        }
+        PresenceVisibility::Friends => {
+            relationship.is_friend || relationship.has_pending_friend_request
+        }
         PresenceVisibility::Nobody => false,
     }
 }
@@ -140,6 +158,7 @@ pub async fn visible_group_member_presence(
                 Relationship {
                     is_self: *user_id == viewer_id,
                     is_friend: friend_ids.contains(user_id),
+                    has_pending_friend_request: false,
                     shares_group: true,
                     shares_meeting: false,
                 },
@@ -191,13 +210,22 @@ mod tests {
     const STRANGER: Relationship = Relationship {
         is_self: false,
         is_friend: false,
+        has_pending_friend_request: false,
         shares_group: false,
         shares_meeting: false,
     };
     const GROUP_CONTACT: Relationship = Relationship {
         is_self: false,
         is_friend: false,
+        has_pending_friend_request: false,
         shares_group: true,
+        shares_meeting: false,
+    };
+    const PENDING_FRIEND_REQUEST: Relationship = Relationship {
+        is_self: false,
+        is_friend: false,
+        has_pending_friend_request: true,
+        shares_group: false,
         shares_meeting: false,
     };
 
@@ -217,6 +245,7 @@ mod tests {
             visible_presence(user, UserStatus::Away, now, GROUP_CONTACT),
             None
         );
+        assert!(visible_presence(user, UserStatus::Away, now, PENDING_FRIEND_REQUEST).is_some());
         assert_eq!(
             visible_presence(user, UserStatus::Away, now, STRANGER),
             None
