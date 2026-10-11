@@ -115,8 +115,8 @@ WHERE requester_id BETWEEN '00000000-0000-0000-0000-000000000007'::uuid
 
 INSERT INTO conversations (id, kind, creator_id, title, access_policy, group_code)
 VALUES
-    ('20000000-0000-0000-0000-000000000001', 'group', '00000000-0000-0000-0000-000000000001', 'OpenMeet testers', 'open', 'openmeet-testers'),
-    ('20000000-0000-0000-0000-000000000002', 'group', '00000000-0000-0000-0000-000000000001', 'Friends-only lab', 'friends_only', 'friends-only-lab')
+    ('20000000-0000-0000-0000-000000000001', 'group', '00000000-0000-0000-0000-000000000001', 'OpenMeet testers', 'open', '0yNkm9nGBSTDWDtLbt9iCX'),
+    ('20000000-0000-0000-0000-000000000002', 'group', '00000000-0000-0000-0000-000000000001', 'Friends-only lab', 'friends_only', '0yNkm9nGBSTDWDtLbt9iCY')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO conversation_members (conversation_id, user_id, role)
@@ -142,10 +142,10 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO conversations (id, kind, creator_id, title, access_policy, password_hash, group_code)
 VALUES
-    ('23000000-0000-0000-0000-000000000001', 'group', '00000000-0000-0000-0000-000000000007', 'Numbered crew', 'open', NULL, 'numbered-crew'),
-    ('23000000-0000-0000-0000-000000000002', 'group', '00000000-0000-0000-0000-000000000009', 'Design sync', 'friends_only', NULL, 'design-sync'),
-    ('23000000-0000-0000-0000-000000000003', 'group', '00000000-0000-0000-0000-000000000011', 'Members room', 'friends_only', NULL, 'members-room'),
-    ('23000000-0000-0000-0000-000000000004', 'group', '00000000-0000-0000-0000-000000000016', 'Pair lab', 'open', NULL, 'pair-lab')
+    ('23000000-0000-0000-0000-000000000001', 'group', '00000000-0000-0000-0000-000000000007', 'Numbered crew', 'open', NULL, '142jLfiBt9pKbBJqhNVw25'),
+    ('23000000-0000-0000-0000-000000000002', 'group', '00000000-0000-0000-0000-000000000009', 'Design sync', 'friends_only', NULL, '142jLfiBt9pKbBJqhNVw26'),
+    ('23000000-0000-0000-0000-000000000003', 'group', '00000000-0000-0000-0000-000000000011', 'Members room', 'friends_only', NULL, '142jLfiBt9pKbBJqhNVw27'),
+    ('23000000-0000-0000-0000-000000000004', 'group', '00000000-0000-0000-0000-000000000016', 'Pair lab', 'open', NULL, '142jLfiBt9pKbBJqhNVw28')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO conversation_members (conversation_id, user_id, role)

@@ -20,7 +20,7 @@ use crate::{
         SocialResource,
         conversations::{
             ConversationError, add_member, authorize_group_admission, conversation_response,
-            ensure_user_exists, group_member_role, group_policy, internal_error,
+            ensure_user_exists, group_avatar_url, group_member_role, group_policy, internal_error,
             load_group_for_update, publish_group_update, require_group_admin_for_update,
         },
         create_notification,
@@ -141,6 +141,7 @@ pub(super) async fn list_group_invitations(
     invitations
         .into_iter()
         .map(|(invitation, group, inviter_name)| {
+            let group_avatar_url = group_avatar_url(&group);
             Ok(GroupInvitationResponse {
                 id: invitation.id,
                 group_id: group.id,
@@ -148,6 +149,7 @@ pub(super) async fn list_group_invitations(
                 group_title: group
                     .title
                     .ok_or_else(|| internal_error("group is missing a title"))?,
+                group_avatar_url,
                 inviter_id: invitation.inviter_id,
                 inviter_name,
                 created_at: invitation.created_at,

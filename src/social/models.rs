@@ -748,6 +748,7 @@ pub struct GroupInvitationResponse {
     pub id: Uuid,
     pub group_id: Uuid,
     pub group_title: String,
+    pub group_avatar_url: Option<String>,
     pub access_policy: GroupAccessPolicy,
     pub inviter_id: Uuid,
     pub inviter_name: String,
@@ -788,6 +789,10 @@ pub struct MessageReplyPreview {
     pub sender_nickname: String,
     /// A short excerpt; the full quoted message stays in the conversation history.
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -824,7 +829,11 @@ pub struct DirectMessageRequestResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateGroupRequest, GroupCodeInfoRequest, JoinGroupByCodeRequest, UserStatus};
+    use super::{
+        CreateGroupRequest, GroupCodeInfoRequest, JoinGroupByCodeRequest, MessageReplyPreview,
+        UserStatus,
+    };
+    use uuid::Uuid;
 
     #[test]
     fn defaults_initial_group_members_to_empty() {
@@ -885,6 +894,38 @@ mod tests {
         assert_eq!(
             serde_json::to_value(UserStatus::DoNotDisturb).unwrap(),
             "doNotDisturb"
+        );
+    }
+
+    #[test]
+    fn serializes_reply_attachment_metadata_only_when_present() {
+        let mut preview = MessageReplyPreview {
+            sequence: 1,
+            sender_id: Uuid::nil(),
+            sender_name: "Ada".to_string(),
+            sender_nickname: "ada".to_string(),
+            content: "Attachment".to_string(),
+            attachment_file_name: None,
+            attachment_count: None,
+        };
+
+        let without_attachments = serde_json::to_value(&preview).unwrap();
+        assert!(without_attachments.get("attachmentFileName").is_none());
+        assert!(without_attachments.get("attachmentCount").is_none());
+
+        preview.attachment_file_name = Some("report.pdf".to_string());
+        preview.attachment_count = Some(2);
+        assert_eq!(
+            serde_json::to_value(preview).unwrap(),
+            serde_json::json!({
+                "sequence": 1,
+                "senderId": "00000000-0000-0000-0000-000000000000",
+                "senderName": "Ada",
+                "senderNickname": "ada",
+                "content": "Attachment",
+                "attachmentFileName": "report.pdf",
+                "attachmentCount": 2,
+            })
         );
     }
 }
