@@ -601,6 +601,10 @@ pub struct IncomingCallSessionResponse {
     pub id: Uuid,
     pub conversation_id: Uuid,
     pub initiator_id: Uuid,
+    /// Lets the ringing bar name the caller on any page, without the user's conversation list.
+    pub initiator_name: String,
+    /// The group's title for a group call; direct calls have none.
+    pub conversation_title: Option<String>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
