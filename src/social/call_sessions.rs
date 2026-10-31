@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use axum::{
     Json, Router,
@@ -58,6 +60,13 @@ fn call_room_ended() -> diesel::expression::SqlLiteral<Bool> {
     diesel::dsl::sql::<Bool>(&CALL_ROOM_ENDED_SQL.replace("{room}", "call_sessions.sfu_room_id"))
 }
 
+/// SQL condition, with `{room}` standing for the call's SFU room ID and `{user}` for a user, that holds
+/// while anyone other than that user (a member or a guest) is in the call's live meeting.
+pub(crate) const CALL_ROOM_HAS_OTHERS_SQL: &str = "EXISTS (SELECT 1 FROM meeting_participants AS present \
+     JOIN meeting_sessions AS present_room ON present_room.id = present.meeting_session_id \
+     WHERE present_room.sfu_room_id = {room} AND present_room.ended_at IS NULL \
+     AND present.left_at IS NULL AND (present.user_id IS NULL OR present.user_id <> {user}))";
+
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +116,7 @@ pub fn call_session_routes() -> Router<AppState> {
         .route("/incoming", get(list_incoming_call_sessions))
         .route("/{id}", get(get_call_session))
         .route("/{id}/respond", post(respond_to_call_session))
+        .route("/{id}/cancel", post(cancel_call_session))
 }
 
 pub async fn start_call_session(
@@ -302,6 +312,33 @@ async fn list_incoming_call_sessions(
         .await
         .map_err(internal_error)?;
 
+    let initiator_ids: Vec<Uuid> = sessions
+        .iter()
+        .map(|session| session.initiator_id)
+        .collect();
+    let initiator_names: HashMap<Uuid, String> = users::table
+        .filter(users::id.eq_any(&initiator_ids))
+        .select((users::id, users::name))
+        .load::<(Uuid, String)>(&mut conn)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .collect();
+    let conversation_ids: Vec<Uuid> = sessions
+        .iter()
+        .map(|session| session.conversation_id)
+        .collect();
+    let group_titles: HashMap<Uuid, String> = conversations::table
+        .filter(conversations::id.eq_any(&conversation_ids))
+        .filter(conversations::kind.eq("group"))
+        .select((conversations::id, conversations::title))
+        .load::<(Uuid, Option<String>)>(&mut conn)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .filter_map(|(id, title)| title.map(|title| (id, title)))
+        .collect();
+
     Ok(Json(
         sessions
             .into_iter()
@@ -309,6 +346,11 @@ async fn list_incoming_call_sessions(
                 id: session.id,
                 conversation_id: session.conversation_id,
                 initiator_id: session.initiator_id,
+                initiator_name: initiator_names
+                    .get(&session.initiator_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                conversation_title: group_titles.get(&session.conversation_id).cloned(),
                 expires_at: session.expires_at,
                 created_at: session.created_at,
             })
@@ -347,6 +389,49 @@ async fn get_call_session(
         })?;
 
     Ok(Json(CallSessionJoinResponse { room_id }))
+}
+
+/// The caller leaves a call. When nobody else is in it, it stops ringing for everyone and counts as
+/// missed for those who never answered; this covers a caller who quits before joining the meeting,
+/// which never starts the meeting whose end would stop the call. A call someone is still in keeps
+/// ringing and ends when its last person leaves (`meetings::record_leave`). Anyone else's request,
+/// or a request for a call that already ended, changes nothing.
+async fn cancel_call_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(call_session_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let room_has_others = CALL_ROOM_HAS_OTHERS_SQL.replace("{room}", "call_sessions.sfu_room_id");
+    let (before_user, after_user) = room_has_others
+        .split_once("{user}")
+        .expect("the condition names the user");
+    let cancelled = diesel::update(
+        call_sessions::table
+            .filter(call_sessions::id.eq(call_session_id))
+            .filter(call_sessions::initiator_id.eq(user_id))
+            .filter(call_sessions::status.eq("active"))
+            .filter(diesel::dsl::not(
+                diesel::dsl::sql::<Bool>(before_user)
+                    .bind::<SqlUuid, _>(user_id)
+                    .sql(after_user),
+            )),
+    )
+    .set(call_sessions::status.eq("expired"))
+    .returning(call_sessions::id)
+    .get_result::<Uuid>(&mut conn)
+    .await
+    .optional()
+    .map_err(internal_error)?;
+
+    if cancelled.is_some() {
+        let recipients = call_session_member_ids(&mut conn, call_session_id).await?;
+        state
+            .social_events
+            .publish(recipients, SocialResource::Calls);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn respond_to_call_session(
@@ -617,8 +702,8 @@ fn is_direct_participant(low_id: Uuid, high_id: Uuid, user_id: Uuid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CALL_ROOM_ENDED_SQL, CALL_SESSION_TTL, SfuRoomAuthorization, call_session_response,
-        classify_sfu_room_authorization, is_direct_participant,
+        CALL_ROOM_ENDED_SQL, CALL_ROOM_HAS_OTHERS_SQL, CALL_SESSION_TTL, SfuRoomAuthorization,
+        call_session_response, classify_sfu_room_authorization, is_direct_participant,
     };
     use uuid::Uuid;
 
@@ -629,6 +714,18 @@ mod tests {
         assert!(sql.contains("NOT EXISTS (SELECT 1 FROM meeting_sessions AS live_room"));
         assert!(sql.contains("live_room.ended_at IS NULL"));
         assert_eq!(sql.matches("s.sfu_room_id").count(), 2);
+    }
+
+    #[test]
+    fn a_caller_cancels_only_while_nobody_else_is_in_the_live_meeting() {
+        let sql = CALL_ROOM_HAS_OTHERS_SQL
+            .replace("{room}", "call_sessions.sfu_room_id")
+            .replace("{user}", "'caller'");
+        assert!(sql.contains("present_room.sfu_room_id = call_sessions.sfu_room_id"));
+        assert!(sql.contains("present_room.ended_at IS NULL"));
+        assert!(sql.contains("present.left_at IS NULL"));
+        // Guests have no user ID and still count as someone in the call.
+        assert!(sql.contains("present.user_id IS NULL OR present.user_id <> 'caller'"));
     }
 
     #[test]
