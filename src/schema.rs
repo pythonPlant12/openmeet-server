@@ -73,6 +73,8 @@ diesel::table! {
         content_type -> Varchar,
         byte_size -> Int8,
         created_at -> Timestamptz,
+        voice_duration_ms -> Nullable<Int4>,
+        voice_waveform -> Nullable<Bytea>,
     }
 }
 

@@ -13,6 +13,7 @@ mod messages;
 mod models;
 mod notifications;
 mod presence;
+mod shared_media;
 
 use axum::http::{HeaderMap, header};
 
