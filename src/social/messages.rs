@@ -36,6 +36,7 @@ use crate::{
             CreateConversationMessageRequest, ListConversationMessagesQuery,
             MessageAttachmentResponse, MessageReactionSummary, MessageReplyPreview,
             NewConversationMessage, NewConversationMessageAttachment, ToggleMessageReactionRequest,
+            VoiceMessageDetails,
         },
     },
     storage::AvatarStorage,
@@ -54,6 +55,9 @@ const MAX_FILE_NAME_BYTES: usize = 255;
 const MAX_CONTENT_TYPE_BYTES: usize = 255;
 const MAX_REPLY_TO_SEQUENCE_BYTES: usize = 64;
 const MAX_MESSAGE_CONTENT_BYTES: usize = 8_000;
+const MAX_VOICE_DETAILS_BYTES: usize = 1024;
+const MAX_VOICE_WAVEFORM_BARS: usize = 64;
+const MAX_VOICE_DURATION_MS: i32 = 60 * 60 * 1000;
 pub(crate) const MAX_ATTACHMENT_REQUEST_BYTES: usize = MAX_ATTACHMENT_TOTAL_BYTES + 1024 * 1024;
 
 struct PendingAttachment {
@@ -62,6 +66,7 @@ struct PendingAttachment {
     file_name: String,
     content_type: String,
     bytes: Vec<u8>,
+    voice: Option<VoiceMessageDetails>,
 }
 
 #[derive(Clone)]
@@ -71,6 +76,7 @@ struct UploadedAttachment {
     file_name: String,
     content_type: String,
     byte_size: i64,
+    voice: Option<VoiceMessageDetails>,
 }
 
 #[derive(Debug)]
@@ -252,6 +258,14 @@ pub(crate) async fn create_message_with_attachments(
                             file_name: attachment.file_name.clone(),
                             content_type: attachment.content_type.clone(),
                             byte_size: attachment.byte_size,
+                            voice_duration_ms: attachment
+                                .voice
+                                .as_ref()
+                                .map(|voice| voice.duration_ms),
+                            voice_waveform: attachment
+                                .voice
+                                .as_ref()
+                                .map(|voice| voice.waveform.clone()),
                         })
                         .collect::<Vec<_>>();
                     diesel::insert_into(conversation_message_attachments::table)
@@ -846,7 +860,7 @@ async fn mark_messages_read(
     Ok(())
 }
 
-async fn authorize_conversation_access(
+pub(crate) async fn authorize_conversation_access(
     conn: &mut diesel_async::AsyncPgConnection,
     conversation_id: Uuid,
     user_id: Uuid,
@@ -948,6 +962,10 @@ async fn message_attachments(
                 content_type: attachment.content_type,
                 byte_size: attachment.byte_size,
                 url: attachment_url(conversation_id, attachment.id),
+                voice: VoiceMessageDetails::from_columns(
+                    attachment.voice_duration_ms,
+                    attachment.voice_waveform,
+                ),
             });
     }
     Ok(responses)
@@ -963,10 +981,11 @@ fn attachment_response(
         content_type: attachment.content_type.clone(),
         byte_size: attachment.byte_size,
         url: attachment_url(conversation_id, attachment.id),
+        voice: attachment.voice.clone(),
     }
 }
 
-fn attachment_url(conversation_id: Uuid, attachment_id: Uuid) -> String {
+pub(crate) fn attachment_url(conversation_id: Uuid, attachment_id: Uuid) -> String {
     format!("/social/conversations/{conversation_id}/attachments/{attachment_id}")
 }
 
@@ -1047,7 +1066,23 @@ async fn parse_attachment_message(
                     file_name,
                     content_type,
                     bytes,
+                    voice: None,
                 });
+            }
+            // Describes the audio `file` sent just before it.
+            "voice" => {
+                let bytes = read_multipart_field(field, MAX_VOICE_DETAILS_BYTES).await?;
+                let attachment = attachments.last_mut().ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "voice must follow the file it describes".to_string(),
+                ))?;
+                if attachment.voice.is_some() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "voice may only be provided once per file".to_string(),
+                    ));
+                }
+                attachment.voice = Some(parse_voice_details(&bytes, &attachment.content_type)?);
             }
             _ => {
                 return Err((
@@ -1066,6 +1101,25 @@ async fn parse_attachment_message(
         ));
     }
     Ok((content, reply_to_sequence, attachments))
+}
+
+fn parse_voice_details(
+    bytes: &[u8],
+    content_type: &str,
+) -> Result<VoiceMessageDetails, (StatusCode, String)> {
+    let invalid = |message: &str| (StatusCode::BAD_REQUEST, message.to_string());
+    if !content_type.starts_with("audio/") {
+        return Err(invalid("voice details are only accepted for audio files"));
+    }
+    let details: VoiceMessageDetails = serde_json::from_slice(bytes)
+        .map_err(|_| invalid("voice must be JSON with durationMs and waveform"))?;
+    if !(1..=MAX_VOICE_DURATION_MS).contains(&details.duration_ms) {
+        return Err(invalid("voice durationMs is out of range"));
+    }
+    if details.waveform.is_empty() || details.waveform.len() > MAX_VOICE_WAVEFORM_BARS {
+        return Err(invalid("voice waveform must have between 1 and 64 bars"));
+    }
+    Ok(details)
 }
 
 async fn read_multipart_field(
@@ -1111,6 +1165,7 @@ async fn upload_attachments(
             file_name: attachment.file_name,
             content_type: attachment.content_type,
             byte_size,
+            voice: attachment.voice,
         });
     }
     Ok(uploaded)
@@ -1267,9 +1322,39 @@ mod tests {
 
     use super::{
         ListConversationMessagesQuery, content_disposition, excerpt, parse_reply_to_sequence,
-        validate_attachment_content, validate_attachment_metadata, validate_message_content,
-        validate_message_page, validate_reaction,
+        parse_voice_details, validate_attachment_content, validate_attachment_metadata,
+        validate_message_content, validate_message_page, validate_reaction,
     };
+
+    #[test]
+    fn accepts_voice_details_for_audio_files_only() {
+        let details = parse_voice_details(
+            br#"{"durationMs":3200,"waveform":[0,128,255]}"#,
+            "audio/webm",
+        )
+        .unwrap();
+        assert_eq!(details.duration_ms, 3200);
+        assert_eq!(details.waveform, vec![0, 128, 255]);
+
+        let rejected = [
+            (r#"{"durationMs":3200,"waveform":[1]}"#, "image/png"),
+            (r#"{"durationMs":0,"waveform":[1]}"#, "audio/webm"),
+            (r#"{"durationMs":3600001,"waveform":[1]}"#, "audio/webm"),
+            (r#"{"durationMs":3200,"waveform":[]}"#, "audio/webm"),
+            (r#"{"durationMs":3200,"waveform":[256]}"#, "audio/webm"),
+            (r#"{"durationMs":3200}"#, "audio/webm"),
+            ("not json", "audio/webm"),
+        ];
+        for (body, content_type) in rejected {
+            let error = parse_voice_details(body.as_bytes(), content_type).unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{body} as {content_type}");
+        }
+        let too_many_bars = format!(
+            r#"{{"durationMs":3200,"waveform":[{}]}}"#,
+            vec!["1"; 65].join(",")
+        );
+        assert!(parse_voice_details(too_many_bars.as_bytes(), "audio/mp4").is_err());
+    }
 
     #[test]
     fn accepts_emoji_reactions_only() {

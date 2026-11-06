@@ -144,6 +144,8 @@ pub struct ConversationMessageAttachment {
     pub content_type: String,
     pub byte_size: i64,
     pub created_at: DateTime<Utc>,
+    pub voice_duration_ms: Option<i32>,
+    pub voice_waveform: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Insertable)]
@@ -155,6 +157,8 @@ pub struct NewConversationMessageAttachment {
     pub file_name: String,
     pub content_type: String,
     pub byte_size: i64,
+    pub voice_duration_ms: Option<i32>,
+    pub voice_waveform: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Queryable, Selectable)]
@@ -782,6 +786,26 @@ pub struct MessageAttachmentResponse {
     pub content_type: String,
     pub byte_size: i64,
     pub url: String,
+    /// Recorded length and loudness of a voice message, so players need not decode the audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<VoiceMessageDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceMessageDetails {
+    pub duration_ms: i32,
+    /// Loudness bars from 0 to 255, oldest first.
+    pub waveform: Vec<u8>,
+}
+
+impl VoiceMessageDetails {
+    pub fn from_columns(duration_ms: Option<i32>, waveform: Option<Vec<u8>>) -> Option<Self> {
+        Some(Self {
+            duration_ms: duration_ms?,
+            waveform: waveform?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

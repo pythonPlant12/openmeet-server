@@ -11,7 +11,7 @@ use axum::{
     response::Response,
     routing::{delete, get, post},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use diesel::{
     deserialize::QueryableByName,
     dsl::{exists, not},
@@ -54,6 +54,7 @@ use crate::{
             UserStatus,
         },
         presence,
+        shared_media::{list_shared_media, shared_media_counts},
     },
 };
 
@@ -141,6 +142,8 @@ pub fn conversation_routes() -> Router<AppState> {
             post(respond_to_direct_message_request),
         )
         .route("/{id}/messages", get(list_messages).post(create_message))
+        .route("/{id}/shared", get(list_shared_media))
+        .route("/{id}/shared/counts", get(shared_media_counts))
         .route(
             "/{id}/messages/attachments",
             post(create_message_with_attachments).layer(DefaultBodyLimit::max(
@@ -828,11 +831,32 @@ async fn leave_group(
             async move {
                 let group = load_group_for_update(conn, group_id).await?;
                 if group.creator_id == user_id {
-                    return Err((
+                    // The owner can leave too: the group passes to the next person in line.
+                    let members: Vec<(Uuid, String, DateTime<Utc>)> = conversation_members::table
+                        .filter(conversation_members::conversation_id.eq(group_id))
+                        .select((
+                            conversation_members::user_id,
+                            conversation_members::role,
+                            conversation_members::joined_at,
+                        ))
+                        .load(conn)
+                        .await?;
+                    let successor = group_successor(&members, user_id).ok_or((
                         StatusCode::CONFLICT,
-                        "Transfer group ownership before leaving".to_string(),
+                        "You are the only member. Remove the group instead.".to_string(),
+                    ))?;
+                    diesel::update(conversations::table.find(group_id))
+                        .set(conversations::creator_id.eq(successor))
+                        .execute(conn)
+                        .await?;
+                    diesel::update(
+                        conversation_members::table
+                            .filter(conversation_members::conversation_id.eq(group_id))
+                            .filter(conversation_members::user_id.eq(successor)),
                     )
-                        .into());
+                    .set(conversation_members::role.eq("creator"))
+                    .execute(conn)
+                    .await?;
                 }
                 let deleted = diesel::delete(
                     conversation_members::table
@@ -862,6 +886,16 @@ async fn leave_group(
         .publish([user_id], SocialResource::Calls);
     disconnect_user_from_sfu_rooms(&state, &room_ids, user_id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Who owns a group after its owner leaves: the admin who joined first, otherwise the member who joined first.
+fn group_successor(members: &[(Uuid, String, DateTime<Utc>)], leaving: Uuid) -> Option<Uuid> {
+    let staying = || members.iter().filter(|(id, _, _)| *id != leaving);
+    staying()
+        .filter(|(_, role, _)| role == "admin")
+        .min_by_key(|(_, _, joined_at)| *joined_at)
+        .or_else(|| staying().min_by_key(|(_, _, joined_at)| *joined_at))
+        .map(|(id, _, _)| *id)
 }
 
 async fn delete_group(
@@ -2444,6 +2478,28 @@ mod tests {
             .is_err()
         );
         assert!(validate_group_update_request(GroupAccessPolicy::Open, None, true).is_err());
+    }
+
+    #[test]
+    fn passes_a_group_to_the_earliest_admin_then_the_earliest_member() {
+        let at = |minutes: i64| chrono::DateTime::from_timestamp(minutes * 60, 0).unwrap();
+        let (owner, admin, early, late) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let members = vec![
+            (owner, "creator".to_string(), at(0)),
+            (late, "member".to_string(), at(9)),
+            (admin, "admin".to_string(), at(5)),
+            (early, "member".to_string(), at(1)),
+        ];
+        assert_eq!(super::group_successor(&members, owner), Some(admin));
+        assert_eq!(super::group_successor(&members[..2], owner), Some(late));
+        let with_early = vec![members[0].clone(), members[1].clone(), members[3].clone()];
+        assert_eq!(super::group_successor(&with_early, owner), Some(early));
+        assert_eq!(super::group_successor(&members[..1], owner), None);
     }
 
     #[test]
