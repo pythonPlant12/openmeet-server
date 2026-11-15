@@ -33,6 +33,7 @@ use crate::{
     social::{
         SocialResource,
         avatars::{AvatarQuery, avatar_response, delete_avatar, store_avatar, user_avatar_url},
+        call_sessions::live_calls_for_conversations,
         group_invitations,
         handlers::{
             MAX_AVATAR_UPLOAD_BYTES, parse_avatar_upload, user_search_pattern,
@@ -229,11 +230,22 @@ async fn list_conversations(
             .collect::<Vec<_>>(),
     )
     .await?;
+    let mut live_calls = live_calls_for_conversations(
+        &mut conn,
+        &response
+            .iter()
+            .map(|conversation| conversation.id)
+            .collect::<Vec<_>>(),
+        Utc::now(),
+    )
+    .await
+    .map_err(internal_error)?;
     for conversation in &mut response {
         let counts = message_counts.get(&conversation.id);
         conversation.message_count = counts.map(|counts| counts.message_count).unwrap_or(0);
         conversation.unread_count = counts.map(|counts| counts.unread_count).unwrap_or(0);
         conversation.marked_unread = counts.is_some_and(|counts| counts.marked_unread);
+        conversation.live_call = live_calls.remove(&conversation.id);
     }
     response.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
 
@@ -2068,6 +2080,7 @@ pub(super) fn conversation_response(
         marked_unread: false,
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
+        live_call: None,
     })
 }
 

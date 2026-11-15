@@ -30,8 +30,8 @@ use crate::{
         conversations::group_avatar_url,
         models::{
             CallSession, CallSessionJoinResponse, CallSessionMember, CallSessionResponse,
-            CallSessionStartResponse, Conversation, IncomingCallSessionResponse, NewCallSession,
-            NewCallSessionMember, RespondToCallSessionRequest,
+            CallSessionStartResponse, Conversation, IncomingCallSessionResponse, LiveCallResponse,
+            NewCallSession, NewCallSessionMember, RespondToCallSessionRequest,
         },
     },
 };
@@ -111,6 +111,96 @@ impl From<diesel::result::Error> for CallSessionError {
     }
 }
 
+/// What starting a call on a conversation does: create a new session, or join the live one. A live call
+/// is joined by any member, whatever they answered to its ring, and nobody is rung again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallSessionStart {
+    Created,
+    Joined(JoinedMemberChange),
+}
+
+/// How the caller's member row changes when they join a live call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinedMemberChange {
+    /// No row yet: the caller was added to the group after the call began.
+    Insert,
+    /// A pending or declined row becomes accepted.
+    Accept,
+    /// Already accepted: the caller is coming back to the call.
+    Unchanged,
+}
+
+pub(crate) fn classify_call_session_start(
+    has_live_session: bool,
+    member_status: Option<&str>,
+) -> CallSessionStart {
+    if !has_live_session {
+        return CallSessionStart::Created;
+    }
+    CallSessionStart::Joined(match member_status {
+        None => JoinedMemberChange::Insert,
+        Some("accepted") => JoinedMemberChange::Unchanged,
+        Some(_) => JoinedMemberChange::Accept,
+    })
+}
+
+/// One connected person (or nobody, when `user_id` is empty) of a conversation's live call.
+#[derive(Debug, QueryableByName)]
+pub(crate) struct LiveCallRow {
+    #[diesel(sql_type = SqlUuid)]
+    pub conversation_id: Uuid,
+    #[diesel(sql_type = SqlUuid)]
+    pub call_session_id: Uuid,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    pub user_id: Option<Uuid>,
+}
+
+/// The live call of each conversation that has one: an active session whose meeting has not ended, with the
+/// users connected to its room. A session nobody has entered yet is live with nobody in it.
+pub(crate) async fn live_calls_for_conversations(
+    conn: &mut AsyncPgConnection,
+    conversation_ids: &[Uuid],
+    now: DateTime<Utc>,
+) -> Result<HashMap<Uuid, LiveCallResponse>, diesel::result::Error> {
+    if conversation_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<LiveCallRow> = sql_query(format!(
+        "SELECT s.conversation_id, s.id AS call_session_id, present.user_id
+         FROM call_sessions AS s
+         LEFT JOIN meeting_sessions AS live_room
+           ON live_room.sfu_room_id = s.sfu_room_id AND live_room.ended_at IS NULL
+         LEFT JOIN meeting_participants AS present
+           ON present.meeting_session_id = live_room.id AND present.left_at IS NULL
+         WHERE s.conversation_id = ANY($1) AND s.status = 'active' AND s.expires_at > $2 AND NOT {}
+         ORDER BY present.joined_at",
+        CALL_ROOM_ENDED_SQL.replace("{room}", "s.sfu_room_id")
+    ))
+    .bind::<diesel::sql_types::Array<SqlUuid>, _>(conversation_ids)
+    .bind::<diesel::sql_types::Timestamptz, _>(now)
+    .load(conn)
+    .await?;
+    Ok(collect_live_calls(rows))
+}
+
+pub(crate) fn collect_live_calls(rows: Vec<LiveCallRow>) -> HashMap<Uuid, LiveCallResponse> {
+    let mut live = HashMap::new();
+    for row in rows {
+        let call = live
+            .entry(row.conversation_id)
+            .or_insert_with(|| LiveCallResponse {
+                id: row.call_session_id,
+                member_ids: Vec::new(),
+            });
+        if let Some(user_id) = row.user_id
+            && !call.member_ids.contains(&user_id)
+        {
+            call.member_ids.push(user_id);
+        }
+    }
+    live
+}
+
 pub fn call_session_routes() -> Router<AppState> {
     Router::new()
         .route("/incoming", get(list_incoming_call_sessions))
@@ -127,7 +217,12 @@ pub async fn start_call_session(
     let user_id = extract_user_id(&state.jwt, &headers)?;
     let now = Utc::now();
     let mut conn = state.pool.get().await.map_err(internal_error)?;
-    let (session, recipients, conversation_title): (CallSession, Vec<Uuid>, Option<String>) = conn
+    let (session, recipients, conversation_title, joined): (
+        CallSession,
+        Vec<Uuid>,
+        Option<String>,
+        bool,
+    ) = conn
         .transaction(|conn| {
             async move {
                 let conversation = load_conversation_for_update(conn, conversation_id).await?;
@@ -144,18 +239,56 @@ pub async fn start_call_session(
                 .set(call_sessions::status.eq("expired"))
                 .execute(conn)
                 .await?;
-                let existing_session = call_sessions::table
+                let live_session: Option<CallSession> = call_sessions::table
                     .filter(call_sessions::conversation_id.eq(conversation_id))
                     .filter(call_sessions::status.eq("active"))
-                    .select(call_sessions::id)
-                    .first::<Uuid>(conn)
+                    .for_update()
+                    .select(CallSession::as_select())
+                    .first(conn)
                     .await
                     .optional()?;
-                if existing_session.is_some() {
-                    return Err(CallSessionError::from((
-                        StatusCode::CONFLICT,
-                        "A call is already active for this conversation".to_string(),
-                    )));
+                let member_status = match &live_session {
+                    Some(live) => call_session_members::table
+                        .filter(call_session_members::call_session_id.eq(live.id))
+                        .filter(call_session_members::user_id.eq(user_id))
+                        .select(call_session_members::status)
+                        .first::<String>(conn)
+                        .await
+                        .optional()?,
+                    None => None,
+                };
+                // The live call is joined silently: the caller becomes accepted and nobody is rung again.
+                if let Some(live) = live_session {
+                    match classify_call_session_start(true, member_status.as_deref()) {
+                        CallSessionStart::Joined(JoinedMemberChange::Insert) => {
+                            diesel::insert_into(call_session_members::table)
+                                .values(NewCallSessionMember {
+                                    call_session_id: live.id,
+                                    user_id,
+                                    status: "accepted".to_string(),
+                                    responded_at: Some(now),
+                                })
+                                .execute(conn)
+                                .await?;
+                        }
+                        CallSessionStart::Joined(JoinedMemberChange::Accept) => {
+                            diesel::update(
+                                call_session_members::table
+                                    .filter(call_session_members::call_session_id.eq(live.id))
+                                    .filter(call_session_members::user_id.eq(user_id)),
+                            )
+                            .set((
+                                call_session_members::status.eq("accepted"),
+                                call_session_members::responded_at.eq(Some(now)),
+                            ))
+                            .execute(conn)
+                            .await?;
+                        }
+                        CallSessionStart::Joined(JoinedMemberChange::Unchanged)
+                        | CallSessionStart::Created => {}
+                    }
+                    let recipients = call_session_member_ids(conn, live.id).await?;
+                    return Ok((live, recipients, conversation.title, true));
                 }
 
                 let session: CallSession = diesel::insert_into(call_sessions::table)
@@ -187,16 +320,25 @@ pub async fn start_call_session(
                     .execute(conn)
                     .await?;
 
-                Ok((session, participant_ids, conversation.title))
+                Ok((session, participant_ids, conversation.title, false))
             }
             .scope_boxed()
         })
         .await
         .map_err(CallSessionError::into_api_error)?;
 
+    // Joining tells members the call changed (the ring for the joiner stops) but rings nobody.
     state
         .social_events
         .publish(recipients.iter().copied(), SocialResource::Calls);
+    if joined {
+        return Ok(Json(CallSessionStartResponse {
+            id: session.id,
+            room_id: session.sfu_room_id,
+            expires_at: session.expires_at,
+            joined: true,
+        }));
+    }
     alert_incoming_call(
         &state,
         &mut conn,
@@ -218,6 +360,7 @@ pub async fn start_call_session(
         id: session.id,
         room_id: session.sfu_room_id,
         expires_at: session.expires_at,
+        joined: false,
     }))
 }
 
@@ -702,10 +845,94 @@ fn is_direct_participant(low_id: Uuid, high_id: Uuid, user_id: Uuid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CALL_ROOM_ENDED_SQL, CALL_ROOM_HAS_OTHERS_SQL, CALL_SESSION_TTL, SfuRoomAuthorization,
-        call_session_response, classify_sfu_room_authorization, is_direct_participant,
+        CALL_ROOM_ENDED_SQL, CALL_ROOM_HAS_OTHERS_SQL, CALL_SESSION_TTL, CallSessionStart,
+        JoinedMemberChange, LiveCallRow, SfuRoomAuthorization, call_session_response,
+        classify_call_session_start, classify_sfu_room_authorization, collect_live_calls,
+        is_direct_participant,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn live_calls_list_each_connected_member_once_and_never_a_guest() {
+        let group = Uuid::new_v4();
+        let direct = Uuid::new_v4();
+        let group_call = Uuid::new_v4();
+        let direct_call = Uuid::new_v4();
+        let ada = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let rows = vec![
+            LiveCallRow {
+                conversation_id: group,
+                call_session_id: group_call,
+                user_id: Some(ada),
+            },
+            LiveCallRow {
+                conversation_id: group,
+                call_session_id: group_call,
+                user_id: Some(bob),
+            },
+            // Two devices of one person, and a guest without an account.
+            LiveCallRow {
+                conversation_id: group,
+                call_session_id: group_call,
+                user_id: Some(ada),
+            },
+            LiveCallRow {
+                conversation_id: group,
+                call_session_id: group_call,
+                user_id: None,
+            },
+            // A call nobody has entered yet is still live, with nobody in it.
+            LiveCallRow {
+                conversation_id: direct,
+                call_session_id: direct_call,
+                user_id: None,
+            },
+        ];
+
+        let live = collect_live_calls(rows);
+
+        let group_live = &live[&group];
+        assert_eq!(group_live.id, group_call);
+        assert_eq!(group_live.member_ids, vec![ada, bob]);
+        let direct_live = &live[&direct];
+        assert_eq!(direct_live.id, direct_call);
+        assert!(direct_live.member_ids.is_empty());
+    }
+
+    #[test]
+    fn starting_a_call_without_a_live_one_creates_it() {
+        assert_eq!(
+            classify_call_session_start(false, None),
+            CallSessionStart::Created
+        );
+        // A stale member row from an earlier call never matters once no session is active.
+        assert_eq!(
+            classify_call_session_start(false, Some("declined")),
+            CallSessionStart::Created
+        );
+    }
+
+    #[test]
+    fn starting_a_call_with_a_live_one_joins_it_whatever_the_ring_status() {
+        assert_eq!(
+            classify_call_session_start(true, Some("pending")),
+            CallSessionStart::Joined(JoinedMemberChange::Accept)
+        );
+        assert_eq!(
+            classify_call_session_start(true, Some("declined")),
+            CallSessionStart::Joined(JoinedMemberChange::Accept)
+        );
+        assert_eq!(
+            classify_call_session_start(true, Some("accepted")),
+            CallSessionStart::Joined(JoinedMemberChange::Unchanged)
+        );
+        // A member added to the group after the call began has no row yet.
+        assert_eq!(
+            classify_call_session_start(true, None),
+            CallSessionStart::Joined(JoinedMemberChange::Insert)
+        );
+    }
 
     #[test]
     fn a_call_ends_only_after_its_room_had_a_meeting_and_none_is_live() {
