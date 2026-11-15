@@ -597,6 +597,8 @@ pub struct CallSessionStartResponse {
     pub id: Uuid,
     pub room_id: String,
     pub expires_at: DateTime<Utc>,
+    /// True when the conversation already had a live call and the caller joined it instead.
+    pub joined: bool,
 }
 
 #[derive(Debug, Serialize)]
