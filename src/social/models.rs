@@ -653,6 +653,17 @@ pub struct ConversationResponse {
     pub marked_unread: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The conversation's live call, if any. Only members receive a conversation, so a person's calls with
+    /// others are never visible through it.
+    pub live_call: Option<LiveCallResponse>,
+}
+
+/// A call that members of the conversation can join right now, with the users connected to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveCallResponse {
+    pub id: Uuid,
+    pub member_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Serialize)]

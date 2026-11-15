@@ -143,6 +143,7 @@ async fn run_recorder(
             } => {
                 record_join(
                     &pool,
+                    &social_events,
                     &mut live,
                     room_id,
                     participant_id,
@@ -179,6 +180,7 @@ async fn close_abandoned_sessions(pool: &DbPool) -> anyhow::Result<()> {
 
 async fn record_join(
     pool: &DbPool,
+    social_events: &SocialEventHub,
     live: &mut LiveMeetings,
     room_id: String,
     participant_id: String,
@@ -248,7 +250,10 @@ async fn record_join(
     if let Some(meeting) = live.rooms.get_mut(&room_id) {
         meeting.participant_ids.insert(participant_id.clone());
     }
-    live.participant_rooms.insert(participant_id, room_id);
+    live.participant_rooms
+        .insert(participant_id, room_id.clone());
+    // Members see who is in the live call, so every join is announced, not only the call's end.
+    notify_call_members(&mut conn, social_events, &room_id).await?;
     Ok(())
 }
 
@@ -291,8 +296,10 @@ async fn record_leave(
         .set(meeting_sessions::ended_at.eq(at))
         .execute(&mut conn)
         .await?;
-        notify_call_members(&mut conn, social_events, &room_id).await?;
     }
+    // Every leave is announced: members see who is still in the live call, and when it ends the call stops
+    // ringing and members who never answered have a missed call.
+    notify_call_members(&mut conn, social_events, &room_id).await?;
     Ok(())
 }
 
