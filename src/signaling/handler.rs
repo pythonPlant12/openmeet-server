@@ -837,7 +837,7 @@ async fn handle_message(
                 });
 
                 // Send list of existing participants to the new joiner (with media states)
-                for (id, name, audio_enabled, video_enabled, screen_share_of) in
+                for (id, name, audio_enabled, video_enabled, video_mirrored, screen_share_of) in
                     existing_participants
                 {
                     // Send ParticipantJoined first
@@ -847,12 +847,13 @@ async fn handle_message(
                         screen_share_of,
                     });
 
-                    // If media state is not default (both enabled), send MediaStateChanged
-                    if !audio_enabled || !video_enabled {
+                    // If media state is not default (both enabled, camera mirrored), send MediaStateChanged
+                    if !audio_enabled || !video_enabled || !video_mirrored {
                         let _ = tx.send(SignalingMessage::MediaStateChanged {
                             participant_id: id,
                             audio_enabled,
                             video_enabled,
+                            video_mirrored,
                         });
                     }
                 }
@@ -1596,6 +1597,7 @@ async fn handle_message(
             participant_id: _,
             audio_enabled,
             video_enabled,
+            video_mirrored,
         } => {
             // Update participant's media state and broadcast to others
             if let Some(room_id) = current_room_id {
@@ -1610,11 +1612,12 @@ async fn handle_message(
                     if let Some(participant_conn) = room.participants.get_mut(participant_id) {
                         participant_conn.participant.audio_enabled = audio_enabled;
                         participant_conn.participant.video_enabled = video_enabled;
+                        participant_conn.participant.video_mirrored = video_mirrored;
                     }
 
                     info!(
-                        "📢 {} toggled media: audio={}, video={}",
-                        participant_id, audio_enabled, video_enabled
+                        "📢 {} toggled media: audio={}, video={}, mirrored={}",
+                        participant_id, audio_enabled, video_enabled, video_mirrored
                     );
                     room.broadcast_except(
                         participant_id,
@@ -1622,6 +1625,7 @@ async fn handle_message(
                             participant_id: participant_id.to_string(),
                             audio_enabled,
                             video_enabled,
+                            video_mirrored,
                         },
                     );
                 }

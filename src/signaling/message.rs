@@ -132,6 +132,10 @@ pub enum SignalingMessage {
         participant_id: String,
         audio_enabled: bool,
         video_enabled: bool,
+        /// Whether the participant sees their own camera mirrored (a selfie camera, not a phone's back camera),
+        /// so everyone else shows it the same way. Clients that do not send it mirror their own camera.
+        #[serde(default = "mirrored_by_default")]
+        video_mirrored: bool,
     },
 
     /// Chat message from a participant. Clients send `replyToId`; the server fills in the ID, the
@@ -169,6 +173,10 @@ pub enum SignalingMessage {
 
     /// Error message from server
     Error { message: String },
+}
+
+fn mirrored_by_default() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -215,6 +223,27 @@ mod tests {
             }
             _ => panic!("Wrong message type"),
         }
+    }
+
+    #[test]
+    fn test_media_state_mirrors_unless_told_otherwise() {
+        let legacy = r#"{"type":"mediaStateChanged","participantId":"","audioEnabled":true,"videoEnabled":true}"#;
+        let back_camera = r#"{"type":"mediaStateChanged","participantId":"","audioEnabled":true,"videoEnabled":true,"videoMirrored":false}"#;
+
+        assert!(matches!(
+            serde_json::from_str::<SignalingMessage>(legacy).unwrap(),
+            SignalingMessage::MediaStateChanged {
+                video_mirrored: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<SignalingMessage>(back_camera).unwrap(),
+            SignalingMessage::MediaStateChanged {
+                video_mirrored: false,
+                ..
+            }
+        ));
     }
 
     #[test]
