@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::{Permission, extract_user_id, require_permission},
+    auth::{DELETED_USER_ID, Permission, extract_user_id, require_permission},
     db::DbPool,
     schema::{
         meeting_participants, meeting_room_invitations, meeting_rooms, meeting_sessions, users,
@@ -500,6 +500,7 @@ async fn invite_to_meeting_room(
 
     let invitee_exists = users::table
         .find(request.user_id)
+        .filter(users::id.ne(DELETED_USER_ID))
         .select(users::id)
         .first::<Uuid>(&mut conn)
         .await

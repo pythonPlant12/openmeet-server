@@ -16,16 +16,18 @@ pub enum Permission {
     MessagesSend,
     AdminAccess,
     AdminUsersManage,
+    AdminUsersDelete,
     AdminRolesManage,
 }
 
 impl Permission {
-    pub const ALL: [Permission; 6] = [
+    pub const ALL: [Permission; 7] = [
         Permission::AppLogin,
         Permission::MeetingsCreate,
         Permission::MessagesSend,
         Permission::AdminAccess,
         Permission::AdminUsersManage,
+        Permission::AdminUsersDelete,
         Permission::AdminRolesManage,
     ];
 
@@ -36,6 +38,7 @@ impl Permission {
             Permission::MessagesSend => "messages.send",
             Permission::AdminAccess => "admin.access",
             Permission::AdminUsersManage => "admin.users.manage",
+            Permission::AdminUsersDelete => "admin.users.delete",
             Permission::AdminRolesManage => "admin.roles.manage",
         }
     }
@@ -53,6 +56,7 @@ impl Permission {
             Permission::MessagesSend => "You are not allowed to send messages",
             Permission::AdminAccess
             | Permission::AdminUsersManage
+            | Permission::AdminUsersDelete
             | Permission::AdminRolesManage => "You are not allowed to do this",
         }
     }
@@ -124,13 +128,16 @@ mod tests {
     }
 
     #[test]
-    fn roles_migration_seeds_every_permission() {
-        let migration =
-            include_str!("../../migrations/20261011000000_create_roles_and_permissions/up.sql");
+    fn migrations_seed_every_permission() {
+        let migration = [
+            include_str!("../../migrations/20261011000000_create_roles_and_permissions/up.sql"),
+            include_str!("../../migrations/20261122000000_add_account_deletion/up.sql"),
+        ]
+        .concat();
         for permission in Permission::ALL {
             assert!(
                 migration.contains(&format!("('{}',", permission.key())),
-                "{} is missing from the roles migration",
+                "{} is missing from the permission migrations",
                 permission.key()
             );
         }

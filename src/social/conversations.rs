@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::extract_user_id,
+    auth::{DELETED_USER_ID, extract_user_id},
     schema::{
         call_session_members, call_sessions, conversation_hidden_states, conversation_members,
         conversation_message_attachments, conversation_messages, conversations,
@@ -901,7 +901,10 @@ async fn leave_group(
 }
 
 /// Who owns a group after its owner leaves: the admin who joined first, otherwise the member who joined first.
-fn group_successor(members: &[(Uuid, String, DateTime<Utc>)], leaving: Uuid) -> Option<Uuid> {
+pub(super) fn group_successor(
+    members: &[(Uuid, String, DateTime<Utc>)],
+    leaving: Uuid,
+) -> Option<Uuid> {
     let staying = || members.iter().filter(|(id, _, _)| *id != leaving);
     staying()
         .filter(|(_, role, _)| role == "admin")
@@ -1739,7 +1742,11 @@ async fn revoke_group_call_memberships(
     Ok(room_ids)
 }
 
-async fn disconnect_user_from_sfu_rooms(state: &AppState, room_ids: &[String], user_id: Uuid) {
+pub(super) async fn disconnect_user_from_sfu_rooms(
+    state: &AppState,
+    room_ids: &[String],
+    user_id: Uuid,
+) {
     for room_id in room_ids.iter().collect::<HashSet<_>>() {
         if let Err(error) = state.room_repo.deny_room_user(room_id, user_id).await {
             tracing::error!(%error, %room_id, %user_id, "Failed to deny SFU room user");
@@ -1761,7 +1768,7 @@ async fn disconnect_user_from_sfu_rooms(state: &AppState, room_ids: &[String], u
     }
 }
 
-async fn revoke_and_close_sfu_rooms(state: &AppState, room_ids: &[String]) {
+pub(super) async fn revoke_and_close_sfu_rooms(state: &AppState, room_ids: &[String]) {
     for room_id in room_ids.iter().collect::<HashSet<_>>() {
         let room_lock = match state.room_repo.revoke_room(room_id).await {
             Ok(room_lock) => room_lock,
@@ -1936,6 +1943,7 @@ pub(super) async fn ensure_user_exists(
 ) -> Result<(), (StatusCode, String)> {
     users::table
         .find(user_id)
+        .filter(users::id.ne(DELETED_USER_ID))
         .select(users::id)
         .first::<Uuid>(conn)
         .await

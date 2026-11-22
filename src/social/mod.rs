@@ -1,3 +1,4 @@
+mod accounts;
 mod avatars;
 mod badges;
 mod call_sessions;
@@ -17,6 +18,7 @@ mod shared_media;
 
 use axum::http::{HeaderMap, header};
 
+pub use accounts::delete_account;
 pub(crate) use call_sessions::{IncomingCallAlert, alert_incoming_call};
 pub use call_sessions::{
     SfuRoomAuthorization, authorize_sfu_room, call_session_routes, start_call_session,

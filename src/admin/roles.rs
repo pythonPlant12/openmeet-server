@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{ApiResult, authorize, forbidden_message, internal_error};
 use crate::{
     AppState,
-    auth::Permission,
+    auth::{DELETED_USER_ID, Permission},
     schema::{permissions, role_permissions, roles, users},
 };
 
@@ -358,6 +358,7 @@ async fn load_roles(
         permissions.entry(role).or_default().push(key);
     }
     let user_counts: HashMap<String, i64> = users::table
+        .filter(users::id.ne(DELETED_USER_ID))
         .filter(users::role.eq_any(&names))
         .group_by(users::role)
         .select((users::role, count_star()))

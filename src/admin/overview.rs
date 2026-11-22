@@ -7,6 +7,7 @@ use serde::Serialize;
 use super::{ApiResult, authorize, internal_error};
 use crate::{
     AppState,
+    auth::DELETED_USER_ID,
     schema::{conversation_messages, meeting_participants, meeting_sessions, user_presence, users},
     social::ONLINE_WINDOW_SECONDS,
 };
@@ -41,12 +42,14 @@ pub(super) async fn get_overview(
     let day_ago = now - Duration::hours(24);
 
     let users_total = users::table
+        .filter(users::id.ne(DELETED_USER_ID))
         .select(count_star())
         .get_result(&mut conn)
         .await
         .map_err(internal_error)?;
     // users.created_at is a naive UTC timestamp.
     let users_new_last_7_days = users::table
+        .filter(users::id.ne(DELETED_USER_ID))
         .filter(users::created_at.gt((now - Duration::days(7)).naive_utc()))
         .select(count_star())
         .get_result(&mut conn)
@@ -85,6 +88,7 @@ pub(super) async fn get_overview(
         .await
         .map_err(internal_error)?;
     let users_by_role = users::table
+        .filter(users::id.ne(DELETED_USER_ID))
         .group_by(users::role)
         .select((users::role, count_star()))
         .order(users::role.asc())

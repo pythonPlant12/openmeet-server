@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::{extract_user_id, models::User},
+    auth::{DELETED_USER_ID, extract_user_id, models::User},
     schema::{call_invitations, friendships, meeting_history, notifications, user_presence, users},
     social::{
         AlertCallKind, IncomingCallAlert, SocialResource, alert_incoming_call,
@@ -111,7 +111,7 @@ pub async fn search_users(
     let mut conn = state.pool.get().await.map_err(internal_error)?;
 
     let users: Vec<UserDiscovery> = users::table
-        .filter(users::id.ne(user_id))
+        .filter(users::id.ne_all([user_id, DELETED_USER_ID]))
         .filter(
             users::name
                 .ilike(&pattern)
@@ -519,7 +519,10 @@ pub async fn create_friend_request(
         .as_deref()
         .map(str::trim)
         .filter(|email| !email.is_empty());
-    let target_query = users::table.select(User::as_select()).into_boxed();
+    let target_query = users::table
+        .filter(users::id.ne(DELETED_USER_ID))
+        .select(User::as_select())
+        .into_boxed();
     let target_query = match (request.user_id, email) {
         (Some(target_id), _) => target_query.filter(users::id.eq(target_id)),
         (None, Some(email)) => target_query.filter(users::email.eq(email)),
