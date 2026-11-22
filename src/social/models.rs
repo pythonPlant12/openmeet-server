@@ -730,6 +730,31 @@ pub struct GroupCandidatesPage {
     pub next_offset: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GroupSearchQuery {
+    pub query: String,
+    pub offset: Option<i64>,
+}
+
+/// A group the user is not in, found by name or group code.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSearchResult {
+    pub id: Uuid,
+    pub title: String,
+    pub group_code: String,
+    pub avatar_url: Option<String>,
+    pub access_policy: GroupAccessPolicy,
+    pub member_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSearchPage {
+    pub results: Vec<GroupSearchResult>,
+    pub next_offset: Option<i64>,
+}
+
 #[derive(Debug, Queryable, Selectable)]
 #[diesel(table_name = group_invitations)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
