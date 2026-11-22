@@ -12,8 +12,6 @@ pub struct Participant {
     pub name: String,
     pub audio_enabled: bool,
     pub video_enabled: bool,
-    /// Whether this participant sees their own camera mirrored; everyone else shows it the same way.
-    pub video_mirrored: bool,
     pub user_id: Option<Uuid>,
     /// Set for a presenter's screen share, which joins as its own send-only connection.
     pub screen_share_of: Option<String>,
@@ -26,7 +24,6 @@ impl Participant {
             name,
             audio_enabled: true,
             video_enabled: true,
-            video_mirrored: true,
             user_id: None,
             screen_share_of: None,
         }

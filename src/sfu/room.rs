@@ -606,7 +606,7 @@ impl Room {
     /// Get list of all participants with their media states
     pub fn get_participants_with_media_state(
         &self,
-    ) -> Vec<(String, String, bool, bool, bool, Option<String>)> {
+    ) -> Vec<(String, String, bool, bool, Option<String>)> {
         self.participants
             .iter()
             .map(|(id, conn)| {
@@ -615,7 +615,6 @@ impl Room {
                     conn.participant.name.clone(),
                     conn.participant.audio_enabled,
                     conn.participant.video_enabled,
-                    conn.participant.video_mirrored,
                     conn.participant.screen_share_of.clone(),
                 )
             })
