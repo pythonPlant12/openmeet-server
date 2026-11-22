@@ -2258,7 +2258,6 @@ pub(super) fn group_avatar_url(conversation: &Conversation) -> Option<String> {
 
 fn group_avatar_url_with_revision(group_id: Uuid, updated_at: chrono::DateTime<Utc>) -> String {
     format!(
-        .filter(users::id.ne(DELETED_USER_ID))
         "/social/conversations/groups/{group_id}/avatar?v={}",
         updated_at.timestamp_micros()
     )
