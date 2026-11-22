@@ -12,8 +12,9 @@ use uuid::Uuid;
 use super::{ApiResult, authorize, forbidden_message, internal_error, role_permission_keys};
 use crate::{
     AppState,
-    auth::Permission,
+    auth::{DELETED_USER_ID, Permission},
     schema::{refresh_tokens, roles, user_presence, users},
+    social::delete_account,
 };
 
 const DEFAULT_PAGE_SIZE: i64 = 25;
@@ -120,6 +121,7 @@ pub(super) async fn list_users(
     let filtered = || {
         let mut statement = users::table
             .left_join(user_presence::table.on(user_presence::user_id.eq(users::id)))
+            .filter(users::id.ne(DELETED_USER_ID))
             .into_boxed();
         if let Some(pattern) = &search {
             statement = statement.filter(
@@ -180,14 +182,7 @@ pub(super) async fn update_user(
         ));
     }
 
-    let current_role: String = users::table
-        .find(user_id)
-        .select(users::role)
-        .first(&mut conn)
-        .await
-        .optional()
-        .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))?;
+    let current_role = managed_user_role(&mut conn, user_id).await?;
     let role_exists: bool = diesel::select(diesel::dsl::exists(
         roles::table.filter(roles::name.eq(&request.role)),
     ))
@@ -226,6 +221,51 @@ pub(super) async fn update_user(
     tracing::info!(admin_id = %admin.id, %user_id, role = %request.role, "Admin changed user role");
 
     load_user(&mut conn, user_id).await.map(Json)
+}
+
+// DELETE /admin/users/{id}
+pub(super) async fn delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let (admin, mut conn) = authorize(&state, &headers, Some(Permission::AdminUsersDelete)).await?;
+    if admin.id == user_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "You cannot delete your own account".to_string(),
+        ));
+    }
+
+    // Only delete users whose role holds nothing the admin lacks, as for role changes.
+    let role = managed_user_role(&mut conn, user_id).await?;
+    let permissions = role_permission_keys(&mut conn, &role)
+        .await
+        .map_err(internal_error)?;
+    if !admin.holds_all(&permissions) {
+        return Err((StatusCode::FORBIDDEN, forbidden_message().to_string()));
+    }
+    drop(conn);
+
+    delete_account(&state, user_id).await?;
+    tracing::info!(admin_id = %admin.id, %user_id, "Admin deleted user account");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The role of a user the admin panel may manage. The deleted user placeholder is not one.
+async fn managed_user_role(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+) -> Result<String, (StatusCode, String)> {
+    users::table
+        .find(user_id)
+        .filter(users::id.ne(DELETED_USER_ID))
+        .select(users::role)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "User not found".to_string()))
 }
 
 /// Deletes refresh tokens so the user is signed out when the current access token expires.

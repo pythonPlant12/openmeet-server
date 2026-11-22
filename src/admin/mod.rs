@@ -1,5 +1,5 @@
 //! Admin API for the openmeet-admin panel. Every route needs the `admin.access` permission; routes that
-//! change users or roles also need the matching manage permission.
+//! change users or roles also need the matching manage permission, and deleting a user needs `admin.users.delete`.
 
 mod accounts;
 mod overview;
@@ -35,7 +35,10 @@ pub fn admin_routes() -> Router<AppState> {
         .route("/overview", get(overview::get_overview))
         .route("/rooms", get(rooms::list_live_rooms))
         .route("/users", get(accounts::list_users))
-        .route("/users/{id}", patch(accounts::update_user))
+        .route(
+            "/users/{id}",
+            patch(accounts::update_user).delete(accounts::delete_user),
+        )
         .route("/permissions", get(roles::list_permissions))
         .route("/roles", get(roles::list_roles).post(roles::create_role))
         .route(

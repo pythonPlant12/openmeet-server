@@ -17,14 +17,14 @@ use diesel::{
     dsl::{exists, not},
     prelude::*,
     sql_query,
-    sql_types::{Array, BigInt, Bool, Text, Uuid as SqlUuid},
+    sql_types::{Array, BigInt, Bool, Nullable, Text, Timestamptz, Uuid as SqlUuid},
 };
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::extract_user_id,
+    auth::{DELETED_USER_ID, extract_user_id},
     schema::{
         call_session_members, call_sessions, conversation_hidden_states, conversation_members,
         conversation_message_attachments, conversation_messages, conversations,
@@ -48,11 +48,11 @@ use crate::{
             ConversationResponse, CreateGroupRequest, DirectMessageRequest,
             DirectMessageRequestResponse, GroupAccessPolicy, GroupCandidate, GroupCandidatesPage,
             GroupCandidatesQuery, GroupCodeInfoRequest, GroupInfoResponse, GroupMemberResponse,
-            GroupMembersPage, JoinGroupByCodeRequest, JoinGroupRequest, NewConversation,
-            NewConversationMember, NewDirectMessageRequest, NewRevokedSfuRoom,
-            OpenDirectConversationResponse, PageQuery, RespondToDirectMessageRequest,
-            UpdateConversationMemberRoleRequest, UpdateGroupPolicyRequest, UpdateGroupRequest,
-            UserStatus,
+            GroupMembersPage, GroupSearchPage, GroupSearchQuery, GroupSearchResult,
+            JoinGroupByCodeRequest, JoinGroupRequest, NewConversation, NewConversationMember,
+            NewDirectMessageRequest, NewRevokedSfuRoom, OpenDirectConversationResponse, PageQuery,
+            RespondToDirectMessageRequest, UpdateConversationMemberRoleRequest,
+            UpdateGroupPolicyRequest, UpdateGroupRequest, UserStatus,
         },
         presence,
         shared_media::{list_shared_media, shared_media_counts},
@@ -95,7 +95,9 @@ pub fn conversation_routes() -> Router<AppState> {
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/code/info", post(get_group_info_by_code))
         .route("/groups/code/join", post(join_group_by_code))
+        .route("/groups/search", get(search_groups))
         .route("/groups/{id}/info", get(get_group_info))
+        .route("/groups/{id}/unlock", post(unlock_group_info))
         .route("/groups/{id}/join", post(join_group))
         .route("/groups/{id}/leave", post(leave_group))
         .route("/groups/{id}/policy", post(update_group_policy))
@@ -361,6 +363,161 @@ async fn get_group_info_by_code(
     Ok(Json(group_info_response(&mut conn, group, user_id).await?))
 }
 
+/// Finds groups the user is not in by name or group code, one page at a time. Open and password groups are found by
+/// anyone; friends-only and friends-of-friends groups only by people their friendship rule would let join, the same
+/// rule `can_see_group` and joining apply.
+async fn search_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(request): Query<GroupSearchQuery>,
+) -> ApiResult<GroupSearchPage> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let offset = validated_page_offset(request.offset)?;
+    // Group codes are shown with a leading #, so a pasted code matches too.
+    let query =
+        validated_user_search_query(request.query.trim().trim_start_matches('#')).ok_or((
+            StatusCode::BAD_REQUEST,
+            "Query must be 2 to 80 characters".to_string(),
+        ))?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+
+    let mut groups: Vec<GroupSearchRow> = sql_query(
+        "SELECT g.id, g.title, g.group_code, g.access_policy, g.avatar_key, g.updated_at,
+                (SELECT COUNT(*) FROM conversation_members AS counted
+                 WHERE counted.conversation_id = g.id) AS member_count
+         FROM conversations AS g
+         WHERE g.kind = 'group'
+           AND g.title IS NOT NULL
+           AND g.group_code IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM conversation_members AS own
+               WHERE own.conversation_id = g.id AND own.user_id = $1
+           )
+           AND (g.title ILIKE $2 OR g.group_code ILIKE $2 OR g.legacy_group_code ILIKE $2)
+           AND CASE g.access_policy
+               WHEN 'open' THEN TRUE
+               WHEN 'password' THEN TRUE
+               WHEN 'friends_of_friends' THEN EXISTS (
+                   SELECT 1
+                   FROM conversation_members AS member
+                   JOIN friendships AS friendship
+                     ON friendship.status = 'accepted'
+                    AND ((friendship.requester_id = member.user_id AND friendship.addressee_id = $1)
+                      OR (friendship.addressee_id = member.user_id AND friendship.requester_id = $1))
+                   WHERE member.conversation_id = g.id
+               )
+               WHEN 'friends_only' THEN NOT EXISTS (
+                   SELECT 1
+                   FROM conversation_members AS member
+                   WHERE member.conversation_id = g.id
+                     AND NOT EXISTS (
+                         SELECT 1 FROM friendships AS friendship
+                         WHERE friendship.status = 'accepted'
+                           AND ((friendship.requester_id = member.user_id AND friendship.addressee_id = $1)
+                             OR (friendship.addressee_id = member.user_id AND friendship.requester_id = $1))
+                     )
+               )
+               ELSE FALSE
+           END
+         ORDER BY g.title, g.id
+         OFFSET $3
+         LIMIT $4",
+    )
+    .bind::<SqlUuid, _>(user_id)
+    .bind::<Text, _>(user_search_pattern(query))
+    .bind::<BigInt, _>(offset)
+    .bind::<BigInt, _>(GROUP_PAGE_SIZE + 1)
+    .load(&mut conn)
+    .await
+    .map_err(internal_error)?;
+    let next_offset = next_page_offset(&mut groups, offset);
+
+    let mut results = Vec::with_capacity(groups.len());
+    for group in groups {
+        let access_policy = GroupAccessPolicy::from_db_value(&group.access_policy)
+            .ok_or_else(|| internal_error("group has an unknown access policy"))?;
+        results.push(GroupSearchResult {
+            avatar_url: group
+                .avatar_key
+                .as_ref()
+                .map(|_| group_avatar_url_with_revision(group.id, group.updated_at)),
+            id: group.id,
+            title: group.title,
+            group_code: group.group_code,
+            access_policy,
+            member_count: group.member_count,
+        });
+    }
+
+    Ok(Json(GroupSearchPage {
+        results,
+        next_offset,
+    }))
+}
+
+#[derive(QueryableByName)]
+struct GroupSearchRow {
+    #[diesel(sql_type = SqlUuid)]
+    id: Uuid,
+    #[diesel(sql_type = Text)]
+    title: String,
+    #[diesel(sql_type = Text)]
+    group_code: String,
+    #[diesel(sql_type = Text)]
+    access_policy: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    avatar_key: Option<String>,
+    #[diesel(sql_type = Timestamptz)]
+    updated_at: DateTime<Utc>,
+    #[diesel(sql_type = BigInt)]
+    member_count: i64,
+}
+
+/// Checks a password group's password before its info is shown, so a person found by search sees the group only
+/// after entering it. Joining still sends the password again.
+async fn unlock_group_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<Uuid>,
+    Json(request): Json<JoinGroupRequest>,
+) -> ApiResult<GroupInfoResponse> {
+    let user_id = extract_user_id(&state.jwt, &headers)?;
+    let mut conn = state.pool.get().await.map_err(internal_error)?;
+    let group = load_group(&mut conn, group_id).await?;
+    if matches!(group_policy(&group)?, GroupAccessPolicy::Password)
+        && group_member_role(&mut conn, group_id, user_id)
+            .await?
+            .is_none()
+        && !verify_group_password(group.password_hash.clone(), request.password).await?
+    {
+        return Err((StatusCode::FORBIDDEN, "Invalid group password".to_string()));
+    }
+    Ok(Json(group_info_response(&mut conn, group, user_id).await?))
+}
+
+/// Whether the user may see a group's info and avatar: members always, anyone for open and password groups, and for
+/// friends-only and friends-of-friends groups only the people their friendship rule would let join.
+async fn can_see_group(
+    conn: &mut diesel_async::AsyncPgConnection,
+    group: &Conversation,
+    user_id: Uuid,
+    is_member: bool,
+) -> Result<bool, (StatusCode, String)> {
+    let policy = group_policy(group)?;
+    if can_view_group_info(policy, is_member) {
+        return Ok(true);
+    }
+    match policy {
+        GroupAccessPolicy::FriendsOnly => {
+            is_friends_with_every_member(conn, group.id, user_id).await
+        }
+        GroupAccessPolicy::FriendsOfFriends => {
+            is_friends_with_any_member(conn, group.id, user_id).await
+        }
+        GroupAccessPolicy::Open | GroupAccessPolicy::Password => Ok(false),
+    }
+}
+
 async fn group_info_response(
     conn: &mut diesel_async::AsyncPgConnection,
     group: Conversation,
@@ -369,7 +526,7 @@ async fn group_info_response(
     let role = group_member_role(conn, group.id, user_id).await?;
     let policy = group_policy(&group)?;
 
-    if !can_view_group_info(policy, role.is_some()) {
+    if !can_see_group(conn, &group, user_id, role.is_some()).await? {
         return Err((StatusCode::NOT_FOUND, "Group not found".to_string()));
     }
 
@@ -901,7 +1058,10 @@ async fn leave_group(
 }
 
 /// Who owns a group after its owner leaves: the admin who joined first, otherwise the member who joined first.
-fn group_successor(members: &[(Uuid, String, DateTime<Utc>)], leaving: Uuid) -> Option<Uuid> {
+pub(super) fn group_successor(
+    members: &[(Uuid, String, DateTime<Utc>)],
+    leaving: Uuid,
+) -> Option<Uuid> {
     let staying = || members.iter().filter(|(id, _, _)| *id != leaving);
     staying()
         .filter(|(_, role, _)| role == "admin")
@@ -1019,7 +1179,7 @@ async fn get_group_avatar(
     let is_member = group_member_role(&mut conn, group_id, user_id)
         .await?
         .is_some();
-    if !can_view_group_info(group_policy(&group)?, is_member) {
+    if !can_see_group(&mut conn, &group, user_id, is_member).await? {
         return Err((StatusCode::NOT_FOUND, "Group not found".to_string()));
     }
     let avatar_key = group
@@ -1739,7 +1899,11 @@ async fn revoke_group_call_memberships(
     Ok(room_ids)
 }
 
-async fn disconnect_user_from_sfu_rooms(state: &AppState, room_ids: &[String], user_id: Uuid) {
+pub(super) async fn disconnect_user_from_sfu_rooms(
+    state: &AppState,
+    room_ids: &[String],
+    user_id: Uuid,
+) {
     for room_id in room_ids.iter().collect::<HashSet<_>>() {
         if let Err(error) = state.room_repo.deny_room_user(room_id, user_id).await {
             tracing::error!(%error, %room_id, %user_id, "Failed to deny SFU room user");
@@ -1761,7 +1925,7 @@ async fn disconnect_user_from_sfu_rooms(state: &AppState, room_ids: &[String], u
     }
 }
 
-async fn revoke_and_close_sfu_rooms(state: &AppState, room_ids: &[String]) {
+pub(super) async fn revoke_and_close_sfu_rooms(state: &AppState, room_ids: &[String]) {
     for room_id in room_ids.iter().collect::<HashSet<_>>() {
         let room_lock = match state.room_repo.revoke_room(room_id).await {
             Ok(room_lock) => room_lock,
@@ -1936,6 +2100,7 @@ pub(super) async fn ensure_user_exists(
 ) -> Result<(), (StatusCode, String)> {
     users::table
         .find(user_id)
+        .filter(users::id.ne(DELETED_USER_ID))
         .select(users::id)
         .first::<Uuid>(conn)
         .await
@@ -2093,6 +2258,7 @@ pub(super) fn group_avatar_url(conversation: &Conversation) -> Option<String> {
 
 fn group_avatar_url_with_revision(group_id: Uuid, updated_at: chrono::DateTime<Utc>) -> String {
     format!(
+        .filter(users::id.ne(DELETED_USER_ID))
         "/social/conversations/groups/{group_id}/avatar?v={}",
         updated_at.timestamp_micros()
     )
